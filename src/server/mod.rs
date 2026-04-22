@@ -1,7 +1,6 @@
 //! Server core: bind a local socket (interprocess) or TCP, per-connection
 //! handler, dispatch.
 
-pub mod holder;
 pub mod tts;
 
 use crate::cli::ServeArgs;
@@ -21,8 +20,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tts::{TtsEngine, TtsResult};
-use voxcpm_rs::CancelToken;
 
 struct ServerCtx {
     tts: Option<TtsEngine>,
@@ -200,6 +199,7 @@ where
                     "server was started without --tts-dir",
                 );
             };
+            // Parse just for logging; forward raw json bytes to the worker.
             let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
                 Ok(v) => v,
                 Err(e) => return error_response(ST_BAD_REQUEST, format!("invalid tts json: {e}")),
@@ -215,14 +215,14 @@ where
             );
             let started = std::time::Instant::now();
 
-            let cancel = CancelToken::new();
+            let cancel = Arc::new(Notify::new());
             let watcher_cancel = cancel.clone();
             let watcher = tokio::spawn(async move {
                 let mut buf = [0u8; 16];
                 loop {
                     match read.read(&mut buf).await {
                         Ok(0) | Err(_) => {
-                            watcher_cancel.cancel();
+                            watcher_cancel.notify_one();
                             return;
                         }
                         Ok(_) => {}
@@ -230,7 +230,7 @@ where
                 }
             });
 
-            let result = engine.generate(parsed, req.audio, cancel).await;
+            let result = engine.generate(req.json, req.audio, cancel).await;
             watcher.abort();
 
             match result {
