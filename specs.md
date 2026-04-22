@@ -33,6 +33,7 @@ to force the models to run using your CPU instead of wgpu
 clients can use:
 * `mii-sound --status` to check if the server is up and running (0 yes / 1 no)
 useful for any kind of frontend that wants to consume the tool
+it will also write "running" or "unreachable" to stdout
 
 ## inputs
 inputs are passed as JSONs (primarily) via stdin on clients, you may also use the `--json` flag to be able to pass them explicitly instead of in stdin
