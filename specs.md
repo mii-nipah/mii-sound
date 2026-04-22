@@ -26,9 +26,16 @@ mii-sound serve ... \
   ...
 ```
 
+optionally, you can also:
+* `mii-sound serve --cpu`
+to force the models to run using your CPU instead of wgpu
+
 clients can use:
 * `mii-sound --status` to check if the server is up and running (0 yes / 1 no)
 useful for any kind of frontend that wants to consume the tool
+
+## inputs
+inputs are passed as JSONs (primarily) via stdin on clients, you may also use the `--json` flag to be able to pass them explicitly instead of in stdin
 
 ## tts
 * `mii-sound tts` is how you access the tts module of mii-sound
@@ -62,6 +69,14 @@ you can also:
 ```
 '<>' is a special string that will tell to the client to expect the reference audio file to come after the JSON from stdin
 
+you can configure adherence (CFG) with:
+* `mii-sound tts ... --adherence|--cfg|-a <number (default: 2.0)>`
+the higher the values more adherence to the prompt, but will increase the chance of artifacts
+
+and you can configure the steps with:
+* `mii-sound tts ... --steps|-s <number (default: 10)>`
+the higher the value more steps, after a point has diminishing returns (and can be detrimental) and significantly increases generation times
+
 ## music
 (WIP)
 
@@ -71,7 +86,13 @@ you can also:
 ## cancellation
 the server will consider the generation tied to the socket connection, if the connection dies the generation is cancelled automatically
 
+## formats
+input/output formats are model dependent, but the baseline is .wav
+
 ## exit codes
 0 means success
-1 means the server was not found (clients) / the model/vae was not found (servers)
-2 means unknown error, read stderr for more informations
+1 means server unreachable
+2 means model/vae not found
+3 generation failed / cancelled
+4 bad request / validation
+5 means unknown error, read stderr for more informations
