@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "mii-sound", version, about = "Composable sound generation utility")]
+#[command(
+    name = "mii-sound",
+    version,
+    about = "Composable sound generation utility"
+)]
 pub struct Cli {
     /// Connect to a remote server (host:port). When unset, the local UDS is used.
     #[arg(long, global = true)]

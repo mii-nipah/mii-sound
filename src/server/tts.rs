@@ -80,7 +80,11 @@ impl TtsEngine {
             return Box::pin(retry_after_crash(self.inner.clone(), json, audio, cancel)).await;
         }
 
-        let req = Request { op: OP_TTS, json, audio };
+        let req = Request {
+            op: OP_TTS,
+            json,
+            audio,
+        };
         if let Err(e) = proto::write_request(&mut worker.stdin, &req).await {
             log::warn!("tts worker write failed: {e}; dropping worker");
             *guard = None;
@@ -215,10 +219,7 @@ async fn spawn_worker(model_dir: &PathBuf, cpu: bool) -> Result<RunningWorker> {
             );
         }
         Ok(_) => {
-            return Err(anyhow!(
-                "worker sent unexpected ready byte: {}",
-                ready[0]
-            ));
+            return Err(anyhow!("worker sent unexpected ready byte: {}", ready[0]));
         }
         Err(e) => {
             // Drain the child to surface the real failure if it died early.
@@ -257,7 +258,9 @@ fn spawn_eviction_task(inner: Arc<Inner>) {
             if !should_evict {
                 continue;
             }
-            let Some(mut worker) = guard.take() else { continue };
+            let Some(mut worker) = guard.take() else {
+                continue;
+            };
             log::info!(
                 "unloading tts worker (idle for {})",
                 humantime::format_duration(inner.ttl)

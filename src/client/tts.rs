@@ -60,9 +60,7 @@ pub async fn run(cli: &Cli, args: &TtsArgs) -> ! {
     let inline = user.reference.as_deref() == Some(INLINE_REFERENCE_SENTINEL);
     let audio_bytes = if inline {
         if audio_tail.is_empty() {
-            fail_bad_request(
-                "`reference` is `<>` but no audio bytes followed the JSON on stdin",
-            );
+            fail_bad_request("`reference` is `<>` but no audio bytes followed the JSON on stdin");
         }
         Some(Bytes::from(audio_tail))
     } else {

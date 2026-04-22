@@ -94,8 +94,7 @@ pub async fn read_all_stdin() -> Result<Vec<u8>> {
 }
 
 pub fn split_json_and_rest(data: &[u8]) -> Result<(serde_json::Value, &[u8])> {
-    let mut stream =
-        serde_json::Deserializer::from_slice(data).into_iter::<serde_json::Value>();
+    let mut stream = serde_json::Deserializer::from_slice(data).into_iter::<serde_json::Value>();
     let value = stream
         .next()
         .ok_or_else(|| anyhow::anyhow!("empty JSON input"))?

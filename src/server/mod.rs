@@ -165,7 +165,9 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     if expect_token {
-        let token = proto::read_token(&mut read).await.context("reading token")?;
+        let token = proto::read_token(&mut read)
+            .await
+            .context("reading token")?;
         let expected = ctx.expected_token.clone().unwrap_or_default();
         if token != expected {
             let resp = Response {
@@ -177,7 +179,9 @@ where
         }
     }
 
-    let req = proto::read_request(&mut read).await.context("reading request")?;
+    let req = proto::read_request(&mut read)
+        .await
+        .context("reading request")?;
     let response = dispatch(req, &ctx, read).await;
     proto::write_response(&mut write, &response).await?;
     Ok(())
@@ -194,10 +198,7 @@ where
         },
         OP_TTS => {
             let Some(engine) = ctx.tts.as_ref() else {
-                return error_response(
-                    ST_MODEL_MISSING,
-                    "server was started without --tts-dir",
-                );
+                return error_response(ST_MODEL_MISSING, "server was started without --tts-dir");
             };
             // Parse just for logging; forward raw json bytes to the worker.
             let parsed: TtsRequest = match serde_json::from_slice(&req.json) {

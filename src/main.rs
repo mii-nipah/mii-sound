@@ -24,10 +24,8 @@ async fn main() {
         (Some(Command::TtsWorker(_)), _) => "info",
         _ => "warn",
     };
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_level),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .init();
 
     if parsed.status {
         let code = client::run_status(&parsed).await;
@@ -54,9 +52,7 @@ async fn main() {
             }
         },
         None => {
-            eprintln!(
-                "mii-sound: no subcommand given (use `tts` or `serve`, or pass --status)"
-            );
+            eprintln!("mii-sound: no subcommand given (use `tts` or `serve`, or pass --status)");
             std::process::exit(exit::BAD_REQUEST);
         }
     }

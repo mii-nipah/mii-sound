@@ -32,7 +32,10 @@ pub async fn run(args: TtsWorkerArgs) -> Result<()> {
     let model = tokio::task::spawn_blocking(move || synth::load(&dir, cpu))
         .await
         .map_err(|e| anyhow!("worker load task panicked: {e}"))??;
-    log::info!("tts worker ready (loaded in {:.2?})", load_started.elapsed());
+    log::info!(
+        "tts worker ready (loaded in {:.2?})",
+        load_started.elapsed()
+    );
     let model = Arc::new(StdMutex::new(model));
 
     // Slot holding the in-flight request's cancel token so SIGUSR1 can flip
@@ -58,8 +61,7 @@ pub async fn run(args: TtsWorkerArgs) -> Result<()> {
                 return Ok(());
             }
         };
-        let resp =
-            handle_request(model.clone(), current_cancel.clone(), req).await;
+        let resp = handle_request(model.clone(), current_cancel.clone(), req).await;
         if let Err(e) = proto::write_response(&mut stdout, &resp).await {
             log::warn!("tts worker stdout closed: {e}");
             return Ok(());
@@ -73,7 +75,10 @@ async fn handle_request(
     req: Request,
 ) -> Response {
     if req.op != OP_TTS {
-        return error_response(ST_BAD_REQUEST, format!("worker received non-tts op {}", req.op));
+        return error_response(
+            ST_BAD_REQUEST,
+            format!("worker received non-tts op {}", req.op),
+        );
     }
     let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
         Ok(v) => v,
@@ -106,7 +111,10 @@ async fn handle_request(
                 started.elapsed(),
                 payload.len()
             );
-            Response { status: ST_OK, payload }
+            Response {
+                status: ST_OK,
+                payload,
+            }
         }
         Ok(Err(SynthError::Cancelled)) => {
             log::info!(
