@@ -98,7 +98,7 @@ async fn handle_request(
 
     let join = tokio::task::spawn_blocking(move || {
         let guard = model.lock().expect("model mutex poisoned");
-        synth::synthesize(&*guard, parsed, req.audio, cancel)
+        synth::synthesize(&guard, parsed, req.audio, cancel)
     });
     let result = join.await;
 

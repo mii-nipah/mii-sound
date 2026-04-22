@@ -19,7 +19,7 @@ pub fn default_socket_path() -> PathBuf {
             fn getuid() -> u32;
         }
         let uid = unsafe { getuid() };
-        return PathBuf::from(format!("/tmp/mii-sound-{uid}.sock"));
+        PathBuf::from(format!("/tmp/mii-sound-{uid}.sock"))
     }
     #[cfg(not(unix))]
     {

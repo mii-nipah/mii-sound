@@ -22,10 +22,11 @@ pub const ST_OK: u8 = 0;
 pub const ST_MODEL_MISSING: u8 = 2;
 pub const ST_GENERATION_FAILED: u8 = 3;
 pub const ST_BAD_REQUEST: u8 = 4;
+#[allow(dead_code)] // protocol completeness; reserved for future use
 pub const ST_UNKNOWN: u8 = 5;
 
 // Cap incoming payloads to something generous but bounded.
-const MAX_JSON: u32 = 1 * 1024 * 1024; // 1 MiB JSON
+const MAX_JSON: u32 = 1024 * 1024; // 1 MiB JSON
 const MAX_AUDIO: u32 = 256 * 1024 * 1024; // 256 MiB audio
 const MAX_PAYLOAD: u32 = 512 * 1024 * 1024; // 512 MiB response
 const MAX_TOKEN: u32 = 4096;

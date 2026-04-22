@@ -17,6 +17,7 @@ use burn::backend::{NdArray, Wgpu};
 type CpuBackend = NdArray<f32, i32>;
 type GpuBackend = Wgpu<f32, i32>;
 
+#[allow(clippy::large_enum_variant)] // both variants are large; boxing buys little
 pub enum Model {
     Cpu(VoxCPM<CpuBackend>),
     Gpu(VoxCPM<GpuBackend>),
@@ -87,10 +88,10 @@ fn build_prompt(req: &TtsRequest, inline_audio: Option<Bytes>) -> Result<Option<
         let bytes = inline_audio
             .ok_or_else(|| anyhow!("inline reference flagged but no audio bytes received"))?;
         Some(PromptAudio::Encoded(bytes.to_vec()))
-    } else if let Some(path) = req.reference.as_ref() {
-        Some(PathBuf::from(path).into())
     } else {
-        None
+        req.reference
+            .as_ref()
+            .map(|path| PathBuf::from(path).into())
     };
     Ok(match (audio, req.continuation.as_ref()) {
         (None, _) => None,

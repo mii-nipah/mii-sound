@@ -72,10 +72,10 @@ pub async fn run(args: ServeArgs, socket_override: Option<PathBuf>) -> Result<()
     } else {
         let name = transport::resolve_name(socket_override.as_deref())?;
         // Best-effort parent dir creation when binding to a filesystem path.
-        if let Some(path) = socket_override.as_deref() {
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.ok();
-            }
+        if let Some(path) = socket_override.as_deref()
+            && let Some(parent) = path.parent()
+        {
+            tokio::fs::create_dir_all(parent).await.ok();
         }
 
         let mut opts = ListenerOptions::new().name(name);
