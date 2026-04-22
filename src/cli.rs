@@ -48,6 +48,10 @@ pub struct ServeArgs {
     /// Listen on a TCP port instead of UDS. Pair with the $TOKEN env var.
     #[arg(long)]
     pub network: Option<u16>,
+
+    /// Suppress per-request and lifecycle logs (errors are still printed).
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, Parser)]

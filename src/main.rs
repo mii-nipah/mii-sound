@@ -10,8 +10,21 @@ use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let parsed = Cli::parse();
+
+    // Pick a sensible default log level per subcommand: serve is chatty by
+    // default (you usually want to see what's happening); the tts client is
+    // quiet so it doesn't pollute stderr when piping audio. RUST_LOG always
+    // overrides.
+    let default_level = match (&parsed.command, parsed.status) {
+        (Some(Command::Serve(args)), _) if args.quiet => "warn",
+        (Some(Command::Serve(_)), _) => "info",
+        _ => "warn",
+    };
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_level),
+    )
+    .init();
 
     if parsed.status {
         let code = client::run_status(&parsed).await;

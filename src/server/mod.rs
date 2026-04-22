@@ -35,6 +35,17 @@ pub async fn run(args: ServeArgs, socket_override: Option<PathBuf>) -> Result<()
         .as_ref()
         .map(|dir| TtsEngine::new(dir.clone(), args.holds, args.cpu));
 
+    if let Some(dir) = args.tts_dir.as_ref() {
+        log::info!(
+            "tts engine ready (backend={}, model_dir={}, holds={})",
+            if args.cpu { "cpu" } else { "wgpu" },
+            dir.display(),
+            humantime::format_duration(args.holds),
+        );
+    } else {
+        log::info!("no --tts-dir given; tts requests will be rejected");
+    }
+
     let expected_token = if args.network.is_some() {
         Some(transport::token_from_env().unwrap_or_default())
     } else {
