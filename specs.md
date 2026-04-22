@@ -21,8 +21,7 @@ and you can pass `--url=<url:port>` to clients universally for them to be able t
 when serving, you *need* to pass the model weights path to the command,
 ```sh
 mii-sound serve ... \
-  --tts-model <path.safetensors> \
-  --tts-vae <path.pth/safetensors> \
+  --tts-dir <path> \
   ...
 ```
 

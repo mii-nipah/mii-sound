@@ -54,7 +54,10 @@ where
 pub async fn run_status(cli: &Cli) -> i32 {
     let mut conn = match connect(cli).await {
         Ok(c) => c,
-        Err(_) => return exit::SERVER_UNREACHABLE,
+        Err(_) => {
+            println!("unreachable");
+            return exit::SERVER_UNREACHABLE;
+        }
     };
     let req = Request {
         op: OP_STATUS,
@@ -62,8 +65,14 @@ pub async fn run_status(cli: &Cli) -> i32 {
         audio: None,
     };
     match send_recv(&mut conn, &req).await {
-        Ok(resp) if resp.status == proto::ST_OK => exit::SUCCESS,
-        _ => exit::SERVER_UNREACHABLE,
+        Ok(resp) if resp.status == proto::ST_OK => {
+            println!("running");
+            exit::SUCCESS
+        }
+        _ => {
+            println!("unreachable");
+            exit::SERVER_UNREACHABLE
+        }
     }
 }
 
