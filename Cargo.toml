@@ -2,6 +2,15 @@
 name = "mii-sound"
 version = "0.1.0"
 edition = "2024"
+description = "A small, composable, unix-y sound generation CLI fueled by voxcpm-rs."
+license = "Apache-2.0"
+repository = "https://github.com/mii-nipah/mii-sound"
+homepage = "https://github.com/mii-nipah/mii-sound"
+documentation = "https://github.com/mii-nipah/mii-sound#readme"
+authors = ["nipah~✰! <mii_nipah@pm.me>"]
+readme = "README.md"
+keywords = ["tts", "audio", "voxcpm", "cli", "speech"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 voxcpm-rs = { version = "0.2.0", features = ["cpu", "wgpu"] }
