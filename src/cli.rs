@@ -29,6 +29,20 @@ pub enum Command {
     Serve(ServeArgs),
     /// Text-to-speech client.
     Tts(TtsArgs),
+    /// Internal: long-lived TTS worker process. Speaks the wire protocol over
+    /// stdin/stdout. Spawned automatically by `serve`; not intended to be run
+    /// by hand.
+    #[command(name = "tts-worker", hide = true)]
+    TtsWorker(TtsWorkerArgs),
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TtsWorkerArgs {
+    #[arg(long)]
+    pub tts_dir: PathBuf,
+
+    #[arg(long)]
+    pub cpu: bool,
 }
 
 #[derive(Debug, Clone, Parser)]

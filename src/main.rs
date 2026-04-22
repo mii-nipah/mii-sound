@@ -3,7 +3,9 @@ mod client;
 mod exit;
 mod proto;
 mod server;
+mod synth;
 mod transport;
+mod worker;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -19,6 +21,7 @@ async fn main() {
     let default_level = match (&parsed.command, parsed.status) {
         (Some(Command::Serve(args)), _) if args.quiet => "warn",
         (Some(Command::Serve(_)), _) => "info",
+        (Some(Command::TtsWorker(_)), _) => "info",
         _ => "warn",
     };
     env_logger::Builder::from_env(
@@ -43,6 +46,13 @@ async fn main() {
             }
         }
         Some(Command::Tts(args)) => client::tts::run(&parsed, &args).await,
+        Some(Command::TtsWorker(args)) => match worker::run(args).await {
+            Ok(()) => std::process::exit(exit::SUCCESS),
+            Err(e) => {
+                eprintln!("mii-sound tts-worker: {e:#}");
+                std::process::exit(exit::UNKNOWN);
+            }
+        },
         None => {
             eprintln!(
                 "mii-sound: no subcommand given (use `tts` or `serve`, or pass --status)"
