@@ -45,9 +45,7 @@ echo '{"text":"hello, world"}' | mii-sound tts --out hello.wav
 Install with cargo:
 
 ```sh
-cargo install --path .
-# or, once published:
-# cargo install mii-sound
+cargo install mii-sound
 ```
 
 Start the server (in one terminal) pointing at a VoxCPM2 model directory:
@@ -63,7 +61,7 @@ echo '{"text":"this is mii-sound speaking"}' \
   | mii-sound tts --out greeting.wav
 ```
 
-That's it. Play `greeting.wav` with whatever you'd like.
+That's it. Play `greeting.wav` with any audio player.
 
 ## Usage
 
