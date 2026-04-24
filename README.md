@@ -21,6 +21,7 @@ echo '{"text":"hello, world"}' | mii-sound tts --out hello.wav
   - [Server](#server)
   - [TTS client](#tts-client)
   - [Voice cloning](#voice-cloning)
+  - [Streaming](#streaming)
   - [Status checks](#status-checks)
 - [Architecture](#architecture)
 - [Exit codes](#exit-codes)
@@ -38,6 +39,7 @@ echo '{"text":"hello, world"}' | mii-sound tts --out hello.wav
 - **Local or networked.** Talks over a Unix socket by default, or TCP with a token.
 - **Backends.** Runs on `wgpu` by default, with a `--cpu` fallback.
 - **Voice cloning.** Bring your own reference audio for supported engines.
+- **Streaming.** `--stream` to start hearing audio before the utterance is done.
 - **Cancellation.** Drop the connection, cancel the generation. No knobs needed.
 
 ## Quick start
@@ -85,7 +87,7 @@ or, for TCP servers, `--url host:port`.
 ### TTS client
 
 ```sh
-mii-sound tts [--out <path>] [--json <inline>] [--cfg <f>] [--steps <n>]
+mii-sound tts [--out <path>] [--json <inline>] [--cfg <f>] [--steps <n>] [--stream]
 ```
 
 Request shape (stdin or `--json`):
@@ -100,6 +102,7 @@ Request shape (stdin or `--json`):
   Higher = more adherence, more artifact risk.
 - `--steps / -s <number>` — diffusion steps (default `10`). Diminishing returns
   past a point, and longer generations.
+- `--stream` — emit audio as it is generated. See [Streaming](#streaming).
 
 Output format is model-dependent; the baseline is `.wav`.
 
@@ -123,6 +126,27 @@ sentinel `"<>"`:
 ```
 
 …and append the raw reference audio bytes after the JSON.
+
+### Streaming
+
+Pass `--stream` to receive audio as it is produced instead of waiting for the
+whole utterance:
+
+```sh
+echo '{"text":"streaming hello!"}' \
+  | mii-sound tts --stream \
+  | aplay -q
+```
+
+The output is a single 16-bit PCM mono WAV at the model's sample rate. On
+stdout the RIFF and `data` chunk sizes are written as `0xFFFFFFFF` — the
+conventional "size unknown / streaming" sentinel that `aplay`, `ffplay`,
+`mpv`, and most decoders accept. With `--out <path>`, the header is finalized
+with the real sizes once the stream completes, so the resulting file is a
+standard, fully-valid WAV.
+
+Dropping the client (Ctrl-C, closed pipe) cancels the generation server-side,
+just like with non-streaming requests.
 
 ### Status checks
 
@@ -170,7 +194,6 @@ the socket cancels the work.
 ## Roadmap
 
 - [ ] **Music** module
-- [ ] **Streaming** output (under active consideration)
 - [ ] More TTS backends
 
 See [specs.md](specs.md) for the living design notes.

@@ -81,7 +81,9 @@ the higher the value more steps, after a point has diminishing returns (and can 
 (WIP)
 
 ## streaming
-* currently unimplemented, under active consideration
+the user can:
+* `mii-sound tts ... --stream`
+to receive the resulting audio as it's generated
 
 ## cancellation
 the server will consider the generation tied to the socket connection, if the connection dies the generation is cancelled automatically

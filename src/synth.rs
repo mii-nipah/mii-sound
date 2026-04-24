@@ -23,6 +23,15 @@ pub enum Model {
     Gpu(VoxCPM<GpuBackend>),
 }
 
+impl Model {
+    pub fn sample_rate(&self) -> u32 {
+        match self {
+            Model::Cpu(m) => m.sample_rate(),
+            Model::Gpu(m) => m.sample_rate(),
+        }
+    }
+}
+
 pub fn load(model_dir: &Path, cpu: bool) -> Result<Model> {
     if cpu {
         let device = NdArrayDevice::default();
@@ -54,6 +63,23 @@ pub fn synthesize(
     }
 }
 
+/// Drive a streaming generation. `on_chunk` is invoked for every audio chunk
+/// (raw f32 mono samples at the model's sample rate) as soon as it is
+/// produced. Returns the model sample rate on success so the caller can emit
+/// a header alongside the chunks.
+pub fn synthesize_stream(
+    model: &Model,
+    req: TtsRequest,
+    inline_audio: Option<Bytes>,
+    cancel: CancelToken,
+    on_chunk: impl FnMut(Vec<f32>),
+) -> Result<u32, SynthError> {
+    match model {
+        Model::Cpu(m) => synth_stream_inner(m, req, inline_audio, cancel, on_chunk),
+        Model::Gpu(m) => synth_stream_inner(m, req, inline_audio, cancel, on_chunk),
+    }
+}
+
 fn synth_inner<B: burn::tensor::backend::Backend>(
     model: &VoxCPM<B>,
     req: TtsRequest,
@@ -80,6 +106,38 @@ fn synth_inner<B: burn::tensor::backend::Backend>(
     audio::encode_wav(&samples, model.sample_rate())
         .map(Bytes::from)
         .map_err(|e| SynthError::Other(format!("encoding wav failed: {e}")))
+}
+
+fn synth_stream_inner<B: burn::tensor::backend::Backend>(
+    model: &VoxCPM<B>,
+    req: TtsRequest,
+    inline_audio: Option<Bytes>,
+    cancel: CancelToken,
+    mut on_chunk: impl FnMut(Vec<f32>),
+) -> Result<u32, SynthError> {
+    let prompt = build_prompt(&req, inline_audio).map_err(|e| SynthError::Other(e.to_string()))?;
+
+    let mut builder = GenerateOptions::builder()
+        .cfg(req.cfg)
+        .timesteps(req.steps as usize)
+        .cancel(cancel);
+    if let Some(p) = prompt {
+        builder = builder.prompt(p);
+    }
+    let opts = builder.build();
+
+    let stream = model
+        .generate_stream(&req.text, opts)
+        .map_err(|e| SynthError::Other(format!("generation failed: {e}")))?;
+
+    for item in stream {
+        match item {
+            Ok(samples) => on_chunk(samples),
+            Err(VoxError::Cancelled) => return Err(SynthError::Cancelled),
+            Err(e) => return Err(SynthError::Other(format!("generation failed: {e}"))),
+        }
+    }
+    Ok(model.sample_rate())
 }
 
 fn build_prompt(req: &TtsRequest, inline_audio: Option<Bytes>) -> Result<Option<Prompt>> {

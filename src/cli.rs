@@ -93,6 +93,14 @@ pub struct TtsArgs {
     /// Number of diffusion steps.
     #[arg(long, short = 's', default_value_t = 10)]
     pub steps: u32,
+
+    /// Stream the audio out as it is generated, instead of waiting for the
+    /// whole utterance. Output is a 16-bit PCM mono WAV; on stdout the RIFF
+    /// and `data` chunk sizes are written as `0xFFFFFFFF` (the streaming
+    /// sentinel most decoders accept), while `--out` finalizes them once the
+    /// stream completes.
+    #[arg(long)]
+    pub stream: bool,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {

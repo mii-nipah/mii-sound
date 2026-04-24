@@ -3,9 +3,10 @@
 use crate::cli::{Cli, TtsArgs};
 use crate::client::{
     Conn, connect, fail_bad_request, fail_unknown, fail_unreachable, handle_response_status,
-    read_all_stdin, send_recv, split_json_and_rest, write_payload_out,
+    read_all_stdin, send_recv, split_json_and_rest, status_to_exit, stream_request,
+    write_payload_out,
 };
-use crate::proto::{OP_TTS, Request, TtsRequest};
+use crate::proto::{OP_TTS, OP_TTS_STREAM, Request, TtsRequest};
 use bytes::Bytes;
 
 const INLINE_REFERENCE_SENTINEL: &str = "<>";
@@ -91,10 +92,23 @@ pub async fn run(cli: &Cli, args: &TtsArgs) -> ! {
         Err(e) => fail_unreachable(e),
     };
     let req = Request {
-        op: OP_TTS,
+        op: if args.stream { OP_TTS_STREAM } else { OP_TTS },
         json: Bytes::from(json),
         audio: audio_bytes,
     };
+
+    if args.stream {
+        match stream_request(&mut conn, &req, args.out.as_deref()).await {
+            Ok(()) => std::process::exit(crate::exit::SUCCESS),
+            Err((status, msg)) => {
+                if !msg.is_empty() {
+                    eprintln!("mii-sound: server error: {msg}");
+                }
+                std::process::exit(status_to_exit(status));
+            }
+        }
+    }
+
     let resp = match send_recv(&mut conn, &req).await {
         Ok(r) => r,
         Err(e) => fail_unreachable(e),

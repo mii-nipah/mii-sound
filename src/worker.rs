@@ -10,11 +10,12 @@
 
 use crate::cli::TtsWorkerArgs;
 use crate::proto::{
-    self, OP_TTS, Request, Response, ST_BAD_REQUEST, ST_GENERATION_FAILED, ST_OK, TtsRequest,
+    self, KIND_CHUNK, KIND_END, KIND_ERROR, KIND_HEADER, OP_TTS, OP_TTS_STREAM, Request, Response,
+    ST_BAD_REQUEST, ST_GENERATION_FAILED, ST_OK, StreamFrame, TtsRequest,
 };
 use crate::synth::{self, Model, SynthError};
 use anyhow::{Context, Result, anyhow};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -61,10 +62,27 @@ pub async fn run(args: TtsWorkerArgs) -> Result<()> {
                 return Ok(());
             }
         };
-        let resp = handle_request(model.clone(), current_cancel.clone(), req).await;
-        if let Err(e) = proto::write_response(&mut stdout, &resp).await {
-            log::warn!("tts worker stdout closed: {e}");
-            return Ok(());
+        match req.op {
+            OP_TTS_STREAM => {
+                if let Err(e) = handle_stream_request(
+                    model.clone(),
+                    current_cancel.clone(),
+                    req,
+                    &mut stdout,
+                )
+                .await
+                {
+                    log::warn!("tts worker stream io error: {e}");
+                    return Ok(());
+                }
+            }
+            _ => {
+                let resp = handle_request(model.clone(), current_cancel.clone(), req).await;
+                if let Err(e) = proto::write_response(&mut stdout, &resp).await {
+                    log::warn!("tts worker stdout closed: {e}");
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -79,8 +97,7 @@ async fn handle_request(
             ST_BAD_REQUEST,
             format!("worker received non-tts op {}", req.op),
         );
-    }
-    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
+    }    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
         Ok(v) => v,
         Err(e) => return error_response(ST_BAD_REQUEST, format!("invalid tts json: {e}")),
     };
@@ -135,6 +152,144 @@ fn error_response(status: u8, msg: impl Into<String>) -> Response {
         status,
         payload: Bytes::from(s.into_bytes()),
     }
+}
+
+async fn handle_stream_request<W>(
+    model: Arc<StdMutex<Model>>,
+    current_cancel: Arc<StdMutex<Option<CancelToken>>>,
+    req: Request,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
+        Ok(v) => v,
+        Err(e) => {
+            return write_stream_error(stdout, ST_BAD_REQUEST, format!("invalid tts json: {e}"))
+                .await;
+        }
+    };
+
+    let cancel = CancelToken::new();
+    *current_cancel.lock().expect("cancel slot poisoned") = Some(cancel.clone());
+
+    let started = Instant::now();
+    log::info!(
+        "tts worker streaming: cfg={} steps={} chars={}",
+        parsed.cfg,
+        parsed.steps,
+        parsed.text.chars().count(),
+    );
+
+    // Bridge sync-blocking iterator to async stdout via a bounded channel.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
+    let model_clone = model.clone();
+    let audio = req.audio.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let guard = model_clone.lock().expect("model mutex poisoned");
+        let sample_rate = guard.sample_rate();
+        let header_tx = tx.clone();
+        let chunk_tx = tx.clone();
+        let mut sent_header = false;
+        let result = synth::synthesize_stream(&guard, parsed, audio, cancel, |samples| {
+            if !sent_header {
+                let _ = header_tx.blocking_send(StreamEvent::Header(sample_rate));
+                sent_header = true;
+            }
+            let _ = chunk_tx.blocking_send(StreamEvent::Chunk(samples));
+        });
+        match result {
+            Ok(_) => {
+                let _ = tx.blocking_send(StreamEvent::End);
+            }
+            Err(SynthError::Cancelled) => {
+                let _ = tx.blocking_send(StreamEvent::Error(
+                    ST_GENERATION_FAILED,
+                    "cancelled".to_string(),
+                ));
+            }
+            Err(SynthError::Other(msg)) => {
+                let _ = tx.blocking_send(StreamEvent::Error(ST_GENERATION_FAILED, msg));
+            }
+        }
+    });
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::Header(sr) => {
+                let frame = StreamFrame {
+                    kind: KIND_HEADER,
+                    payload: proto::header_payload(sr),
+                };
+                proto::write_stream_frame(stdout, &frame)
+                    .await
+                    .context("writing stream header frame")?;
+            }
+            StreamEvent::Chunk(samples) => {
+                let frame = StreamFrame {
+                    kind: KIND_CHUNK,
+                    payload: samples_to_le_bytes(&samples),
+                };
+                proto::write_stream_frame(stdout, &frame)
+                    .await
+                    .context("writing stream chunk frame")?;
+            }
+            StreamEvent::End => {
+                let frame = StreamFrame {
+                    kind: KIND_END,
+                    payload: Bytes::new(),
+                };
+                proto::write_stream_frame(stdout, &frame)
+                    .await
+                    .context("writing stream end frame")?;
+            }
+            StreamEvent::Error(status, msg) => {
+                let frame = StreamFrame {
+                    kind: KIND_ERROR,
+                    payload: proto::error_payload(status, &msg),
+                };
+                proto::write_stream_frame(stdout, &frame)
+                    .await
+                    .context("writing stream error frame")?;
+            }
+        }
+    }
+
+    *current_cancel.lock().expect("cancel slot poisoned") = None;
+    let _ = join.await;
+
+    log::info!("tts worker stream finished in {:.2?}", started.elapsed());
+    Ok(())
+}
+
+enum StreamEvent {
+    Header(u32),
+    Chunk(Vec<f32>),
+    End,
+    Error(u8, String),
+}
+
+fn samples_to_le_bytes(samples: &[f32]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(samples.len() * 4);
+    for &s in samples {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    buf.freeze()
+}
+
+async fn write_stream_error<W>(stdout: &mut W, status: u8, msg: String) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    log::warn!("tts worker stream error (status={status}): {msg}");
+    let frame = StreamFrame {
+        kind: KIND_ERROR,
+        payload: proto::error_payload(status, &msg),
+    };
+    proto::write_stream_frame(stdout, &frame)
+        .await
+        .context("writing stream error frame")
 }
 
 #[cfg(unix)]

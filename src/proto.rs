@@ -16,6 +16,7 @@ pub const PROTO_VERSION: u8 = 1;
 
 pub const OP_TTS: u8 = 1;
 pub const OP_STATUS: u8 = 2;
+pub const OP_TTS_STREAM: u8 = 3;
 
 // Status bytes reuse exit codes for their natural meaning.
 pub const ST_OK: u8 = 0;
@@ -24,6 +25,19 @@ pub const ST_GENERATION_FAILED: u8 = 3;
 pub const ST_BAD_REQUEST: u8 = 4;
 #[allow(dead_code)] // protocol completeness; reserved for future use
 pub const ST_UNKNOWN: u8 = 5;
+
+// Streaming response frame kinds. Only used after the client sends OP_TTS_STREAM;
+// the wire is then a sequence of frames terminated by KIND_END or KIND_ERROR.
+//
+// Frame layout: u8 kind | u32 payload_len LE | payload
+//   KIND_HEADER payload: u32 sample_rate LE
+//   KIND_CHUNK  payload: raw f32 LE samples (mono, model sample rate)
+//   KIND_END    payload: empty
+//   KIND_ERROR  payload: u8 status (one of ST_*) followed by utf-8 message bytes
+pub const KIND_HEADER: u8 = 0;
+pub const KIND_CHUNK: u8 = 1;
+pub const KIND_END: u8 = 2;
+pub const KIND_ERROR: u8 = 3;
 
 // Cap incoming payloads to something generous but bounded.
 const MAX_JSON: u32 = 1024 * 1024; // 1 MiB JSON
@@ -159,4 +173,72 @@ pub async fn read_response<R: AsyncRead + Unpin>(r: &mut R) -> Result<Response> 
         status,
         payload: Bytes::from(buf),
     })
+}
+
+#[derive(Debug)]
+pub struct StreamFrame {
+    pub kind: u8,
+    pub payload: Bytes,
+}
+
+pub async fn write_stream_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    frame: &StreamFrame,
+) -> Result<()> {
+    w.write_u8(frame.kind).await?;
+    w.write_u32_le(frame.payload.len() as u32).await?;
+    if !frame.payload.is_empty() {
+        w.write_all(&frame.payload).await?;
+    }
+    w.flush().await?;
+    Ok(())
+}
+
+pub async fn read_stream_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<StreamFrame> {
+    let kind = r.read_u8().await?;
+    let len = r.read_u32_le().await?;
+    if len > MAX_PAYLOAD {
+        bail!("stream frame too large: {len}");
+    }
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        r.read_exact(&mut buf).await?;
+    }
+    Ok(StreamFrame {
+        kind,
+        payload: Bytes::from(buf),
+    })
+}
+
+/// Build a KIND_HEADER frame payload from a sample rate.
+pub fn header_payload(sample_rate: u32) -> Bytes {
+    Bytes::copy_from_slice(&sample_rate.to_le_bytes())
+}
+
+/// Decode a KIND_HEADER frame payload back into its sample rate.
+pub fn parse_header_payload(payload: &[u8]) -> Result<u32> {
+    if payload.len() != 4 {
+        bail!("invalid header frame payload length: {}", payload.len());
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(payload);
+    Ok(u32::from_le_bytes(buf))
+}
+
+/// Build a KIND_ERROR frame payload from (status, message).
+pub fn error_payload(status: u8, msg: &str) -> Bytes {
+    let mut v = Vec::with_capacity(1 + msg.len());
+    v.push(status);
+    v.extend_from_slice(msg.as_bytes());
+    Bytes::from(v)
+}
+
+/// Decode a KIND_ERROR frame payload back into (status, message).
+pub fn parse_error_payload(payload: &[u8]) -> (u8, String) {
+    if payload.is_empty() {
+        return (ST_UNKNOWN, String::new());
+    }
+    let status = payload[0];
+    let msg = String::from_utf8_lossy(&payload[1..]).into_owned();
+    (status, msg)
 }

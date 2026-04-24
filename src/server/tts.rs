@@ -5,7 +5,10 @@
 //! and unloads the worker (kill + wait) after `--holds` of inactivity to
 //! reclaim VRAM.
 
-use crate::proto::{self, OP_TTS, Request, ST_GENERATION_FAILED, ST_MODEL_MISSING};
+use crate::proto::{
+    self, KIND_END, KIND_ERROR, OP_TTS, OP_TTS_STREAM, Request, ST_GENERATION_FAILED,
+    ST_MODEL_MISSING, StreamFrame,
+};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use std::path::PathBuf;
@@ -21,6 +24,14 @@ pub enum TtsResult {
     ModelMissing(String),
     Cancelled,
     Failed(String),
+}
+
+/// Server-side stream relay: holds the in-flight worker pipe lock for the
+/// duration of the generation and yields raw [`StreamFrame`]s as the worker
+/// produces them. Drop the receiver to abandon further frames (the connection
+/// watcher will drive cancellation independently).
+pub struct TtsStream {
+    pub rx: tokio::sync::mpsc::Receiver<StreamFrame>,
 }
 
 pub struct TtsEngine {
@@ -59,8 +70,7 @@ impl TtsEngine {
         json: Bytes,
         audio: Option<Bytes>,
         cancel: Arc<Notify>,
-    ) -> TtsResult {
-        let mut guard = self.inner.state.lock().await;
+    ) -> TtsResult {        let mut guard = self.inner.state.lock().await;
 
         // Spawn worker on demand.
         if guard.is_none() {
@@ -122,6 +132,116 @@ impl TtsEngine {
                 *guard = None;
                 TtsResult::Failed(format!("worker pipe error: {e}"))
             }
+        }
+    }
+
+    /// Streaming counterpart to [`generate`]. Spawns a relay task that holds
+    /// the worker pipe lock for the duration of the generation and forwards
+    /// every frame from the worker into the returned receiver verbatim.
+    /// On worker spawn failure we synthesize a single `KIND_ERROR` frame so
+    /// the caller can treat the channel uniformly.
+    pub async fn generate_stream(
+        &self,
+        json: Bytes,
+        audio: Option<Bytes>,
+        cancel: Arc<Notify>,
+    ) -> TtsStream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamFrame>(8);
+        let inner = self.inner.clone();
+        tokio::spawn(stream_relay(inner, json, audio, cancel, tx));
+        TtsStream { rx }
+    }
+}
+
+async fn stream_relay(
+    inner: Arc<Inner>,
+    json: Bytes,
+    audio: Option<Bytes>,
+    cancel: Arc<Notify>,
+    tx: tokio::sync::mpsc::Sender<StreamFrame>,
+) {
+    let mut guard = inner.state.lock().await;
+
+    if guard.is_none() {
+        match spawn_worker(&inner.model_dir, inner.cpu).await {
+            Ok(w) => *guard = Some(w),
+            Err(e) => {
+                let frame = StreamFrame {
+                    kind: KIND_ERROR,
+                    payload: proto::error_payload(ST_MODEL_MISSING, &e.to_string()),
+                };
+                let _ = tx.send(frame).await;
+                return;
+            }
+        }
+    }
+    let worker = guard.as_mut().expect("worker just spawned");
+
+    if let Ok(Some(status)) = worker.child.try_wait() {
+        log::warn!("tts worker exited unexpectedly ({status}); will respawn on next request");
+        *guard = None;
+        let frame = StreamFrame {
+            kind: KIND_ERROR,
+            payload: proto::error_payload(
+                ST_GENERATION_FAILED,
+                &format!("worker exited before request ({status})"),
+            ),
+        };
+        let _ = tx.send(frame).await;
+        return;
+    }
+
+    let req = Request {
+        op: OP_TTS_STREAM,
+        json,
+        audio,
+    };
+    if let Err(e) = proto::write_request(&mut worker.stdin, &req).await {
+        log::warn!("tts worker write failed: {e}; dropping worker");
+        *guard = None;
+        let frame = StreamFrame {
+            kind: KIND_ERROR,
+            payload: proto::error_payload(ST_GENERATION_FAILED, &format!("worker pipe error: {e}")),
+        };
+        let _ = tx.send(frame).await;
+        return;
+    }
+
+    let pid = worker.pid;
+    let mut cancel_signaled = false;
+    loop {
+        let frame_result = tokio::select! {
+            r = proto::read_stream_frame(&mut worker.stdout) => r,
+            _ = cancel.notified(), if !cancel_signaled => {
+                send_cancel_signal(pid);
+                cancel_signaled = true;
+                continue;
+            }
+        };
+        let frame = match frame_result {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("tts worker stream read failed: {e}; dropping worker");
+                *guard = None;
+                let err_frame = StreamFrame {
+                    kind: KIND_ERROR,
+                    payload: proto::error_payload(
+                        ST_GENERATION_FAILED,
+                        &format!("worker pipe error: {e}"),
+                    ),
+                };
+                let _ = tx.send(err_frame).await;
+                return;
+            }
+        };
+        let terminal = matches!(frame.kind, KIND_END | KIND_ERROR);
+        // If the receiver is gone, just drain until the worker reports
+        // terminal status (so the worker pipe stays in sync for the next
+        // request). Cancellation should already be in flight.
+        let _ = tx.send(frame).await;
+        if terminal {
+            worker.last_used = Instant::now();
+            return;
         }
     }
 }

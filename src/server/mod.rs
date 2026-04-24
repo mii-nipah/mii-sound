@@ -5,8 +5,8 @@ pub mod tts;
 
 use crate::cli::ServeArgs;
 use crate::proto::{
-    self, OP_STATUS, OP_TTS, Request, Response, ST_BAD_REQUEST, ST_GENERATION_FAILED,
-    ST_MODEL_MISSING, ST_OK, TtsRequest,
+    self, KIND_END, KIND_ERROR, OP_STATUS, OP_TTS, OP_TTS_STREAM, Request, Response,
+    ST_BAD_REQUEST, ST_GENERATION_FAILED, ST_MODEL_MISSING, ST_OK, TtsRequest,
 };
 use crate::transport;
 use anyhow::{Context, Result, anyhow};
@@ -182,6 +182,11 @@ where
     let req = proto::read_request(&mut read)
         .await
         .context("reading request")?;
+
+    if req.op == OP_TTS_STREAM {
+        return handle_stream(req, &ctx, read, &mut write).await;
+    }
+
     let response = dispatch(req, &ctx, read).await;
     proto::write_response(&mut write, &response).await?;
     Ok(())
@@ -265,4 +270,107 @@ fn error_response(status: u8, msg: impl Into<String>) -> Response {
         status,
         payload: Bytes::from(s.into_bytes()),
     }
+}
+
+async fn handle_stream<R, W>(
+    req: Request,
+    ctx: &Arc<ServerCtx>,
+    mut read: R,
+    write: &mut W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send,
+{
+    use crate::proto::StreamFrame;
+
+    let Some(engine) = ctx.tts.as_ref() else {
+        log::warn!("stream request rejected: server started without --tts-dir");
+        let frame = StreamFrame {
+            kind: KIND_ERROR,
+            payload: proto::error_payload(
+                ST_MODEL_MISSING,
+                "server was started without --tts-dir",
+            ),
+        };
+        proto::write_stream_frame(write, &frame).await?;
+        return Ok(());
+    };
+
+    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
+        Ok(v) => v,
+        Err(e) => {
+            let frame = StreamFrame {
+                kind: KIND_ERROR,
+                payload: proto::error_payload(
+                    ST_BAD_REQUEST,
+                    &format!("invalid tts json: {e}"),
+                ),
+            };
+            proto::write_stream_frame(write, &frame).await?;
+            return Ok(());
+        }
+    };
+
+    let preview: String = parsed.text.chars().take(60).collect();
+    log::info!(
+        "tts stream request received: cfg={} steps={} chars={} preview={:?}",
+        parsed.cfg,
+        parsed.steps,
+        parsed.text.chars().count(),
+        preview
+    );
+    let started = std::time::Instant::now();
+
+    let cancel = Arc::new(Notify::new());
+    let watcher_cancel = cancel.clone();
+    let watcher = tokio::spawn(async move {
+        let mut buf = [0u8; 16];
+        loop {
+            match read.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    watcher_cancel.notify_one();
+                    return;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let mut stream = engine.generate_stream(req.json, req.audio, cancel).await;
+    let mut final_kind: Option<u8> = None;
+    while let Some(frame) = stream.rx.recv().await {
+        let kind = frame.kind;
+        proto::write_stream_frame(write, &frame).await?;
+        if matches!(kind, KIND_END | KIND_ERROR) {
+            final_kind = Some(kind);
+            break;
+        }
+    }
+    watcher.abort();
+
+    match final_kind {
+        Some(KIND_END) => {
+            log::info!("tts stream finished in {:.2?}", started.elapsed());
+        }
+        Some(KIND_ERROR) => {
+            log::info!("tts stream ended with error after {:.2?}", started.elapsed());
+        }
+        _ => {
+            log::warn!(
+                "tts stream channel closed without terminal frame after {:.2?}",
+                started.elapsed()
+            );
+            // Provide a terminal error so the client doesn't hang.
+            let frame = StreamFrame {
+                kind: KIND_ERROR,
+                payload: proto::error_payload(
+                    ST_GENERATION_FAILED,
+                    "stream ended without terminal frame",
+                ),
+            };
+            proto::write_stream_frame(write, &frame).await?;
+        }
+    }
+    Ok(())
 }
