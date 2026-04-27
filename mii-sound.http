@@ -1,0 +1,93 @@
+# mii-sound HTTP facade
+#
+# Wraps the `mii-sound` CLI as a small HTTP service. Assumes a local
+# `mii-sound serve` is already running (default: UDS), so the CLI invocations
+# below talk to it for free without needing $TOKEN.
+#
+# Run with:
+#   TOKEN=<secret> mii-http mii-sound.http
+# Validate with:
+#   mii-http --check mii-sound.http
+
+VERSION 1
+BASE /sound
+AUTH Bearer [HEADER Authorization]
+TOKEN_SECRET [ENV TOKEN]
+MAX_BODY_SIZE 50mb
+MAX_QUERY_PARAM_SIZE 32
+TIMEOUT 120s
+
+# --- Health -----------------------------------------------------------------
+
+GET /status
+Response-Type text/plain
+Exec: mii-sound --status
+
+# --- TTS --------------------------------------------------------------------
+#
+# Body is the raw mii-sound TTS JSON, e.g.:
+#   { "text": "hello, world" }
+#
+# It is piped to stdin (so the `text` field, which is free-form, never lands
+# in argv). Tunables that mii-sound exposes as CLI flags are surfaced as
+# typed query params.
+
+POST /tts
+Response-Type audio/wav
+QUERY cfg?: /[0-9]+(\.[0-9]+)?/
+QUERY steps?: int(1..200)
+BODY json
+Exec: $ | mii-sound tts [--cfg %cfg] [--steps %steps]
+
+# Streaming variant — same inputs, but the audio is forwarded with HTTP
+# chunked transfer as `mii-sound` produces it, instead of buffering.
+POST /tts/stream
+Response-Type stream audio/wav
+QUERY cfg?: /[0-9]+(\.[0-9]+)?/
+QUERY steps?: int(1..200)
+BODY json
+Exec: $ | mii-sound tts --stream [--cfg %cfg] [--steps %steps]
+
+# --- Voice cloning ----------------------------------------------------------
+#
+# True multipart upload: a `text` form field plus a `reference` audio file.
+# `text` is piped via stdin into `jq`, which composes the JSON request that
+# `mii-sound tts --voice-clone` consumes. `reference` resolves to a temp file
+# path (safe for argv) and is embedded as `reference` in that JSON.
+#
+# Example:
+#   curl -H "Authorization: Bearer $TOKEN" \
+#        -F "text=speak in this voice" \
+#        -F "reference=@./alice.wav" \
+#        https://host/sound/v1/tts/clone -o cloned.wav
+POST /tts/clone
+Response-Type audio/wav
+QUERY cfg?: /[0-9]+(\.[0-9]+)?/
+QUERY steps?: int(1..200)
+BODY form {
+  text: string
+  reference: binary
+}
+Exec: $.text | jq -Rs --arg ref [$.reference] '\{text: ., reference: $ref\}' | mii-sound tts --voice-clone [--cfg %cfg] [--steps %steps]
+
+# --- Voice cloning ----------------------------------------------------------
+#
+# True multipart upload: a `text` form field plus a `reference` audio file.
+# `text` is piped via stdin into `jq`, which composes the JSON request that
+# `mii-sound tts --voice-clone` consumes. `reference` resolves to a temp file
+# path (safe for argv) and is embedded as `reference` in that JSON.
+#
+# Example:
+#   curl -H "Authorization: Bearer $TOKEN" \
+#        -F "text=speak in this voice" \
+#        -F "reference=@./alice.wav" \
+#        https://host/sound/v1/tts/clone -o cloned.wav
+POST /tts/clone/stream
+Response-Type stream audio/wav
+QUERY cfg?: /[0-9]+(\.[0-9]+)?/
+QUERY steps?: int(1..200)
+BODY form {
+  text: string
+  reference: binary
+}
+Exec: $.text | jq -Rs --arg ref [$.reference] '\{text: ., reference: $ref\}' | mii-sound tts --voice-clone --stream [--cfg %cfg] [--steps %steps]
