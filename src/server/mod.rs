@@ -1,6 +1,7 @@
 //! Server core: bind a local socket (interprocess) or TCP, per-connection
 //! handler, dispatch.
 
+pub mod relay;
 pub mod tts;
 
 use crate::cli::ServeArgs;
@@ -16,6 +17,7 @@ use interprocess::local_socket::tokio::Stream as IpcStream;
 use interprocess::local_socket::traits::tokio::{
     Listener as IpcListenerTrait, Stream as IpcStreamTrait,
 };
+use relay::Relay;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -25,24 +27,45 @@ use tts::{TtsEngine, TtsResult};
 
 struct ServerCtx {
     tts: Option<TtsEngine>,
+    relay: Option<Arc<Relay>>,
     expected_token: Option<String>,
 }
 
 pub async fn run(args: ServeArgs, socket_override: Option<PathBuf>) -> Result<()> {
-    let tts_engine = args
-        .tts_dir
-        .as_ref()
-        .map(|dir| TtsEngine::new(dir.clone(), args.holds, args.cpu));
-
-    if let Some(dir) = args.tts_dir.as_ref() {
-        log::info!(
-            "tts engine ready (backend={}, model_dir={}, holds={})",
-            if args.cpu { "cpu" } else { "wgpu" },
-            dir.display(),
-            humantime::format_duration(args.holds),
+    if args.relay.is_some() && args.tts_dir.is_some() {
+        log::warn!(
+            "--relay and --tts-dir are both set; relay mode will forward all requests and the local model dir is ignored"
         );
+    }
+
+    let relay = match args.relay.as_ref() {
+        Some(url) => {
+            let r = Relay::new(url).context("setting up relay client")?;
+            log::info!("relay mode: forwarding requests to {}", r.upstream());
+            Some(Arc::new(r))
+        }
+        None => None,
+    };
+
+    let tts_engine = if relay.is_some() {
+        None
     } else {
-        log::info!("no --tts-dir given; tts requests will be rejected");
+        args.tts_dir
+            .as_ref()
+            .map(|dir| TtsEngine::new(dir.clone(), args.holds, args.cpu))
+    };
+
+    if relay.is_none() {
+        if let Some(dir) = args.tts_dir.as_ref() {
+            log::info!(
+                "tts engine ready (backend={}, model_dir={}, holds={})",
+                if args.cpu { "cpu" } else { "wgpu" },
+                dir.display(),
+                humantime::format_duration(args.holds),
+            );
+        } else {
+            log::info!("no --tts-dir given; tts requests will be rejected");
+        }
     }
 
     let expected_token = if args.network.is_some() {
@@ -53,6 +76,7 @@ pub async fn run(args: ServeArgs, socket_override: Option<PathBuf>) -> Result<()
 
     let ctx = Arc::new(ServerCtx {
         tts: tts_engine,
+        relay,
         expected_token,
     });
 
@@ -187,6 +211,12 @@ where
         return handle_stream(req, &ctx, read, &mut write).await;
     }
 
+    if let Some(relay) = ctx.relay.clone() {
+        let response = dispatch_relay(req, relay, read).await;
+        proto::write_response(&mut write, &response).await?;
+        return Ok(());
+    }
+
     let response = dispatch(req, &ctx, read).await;
     proto::write_response(&mut write, &response).await?;
     Ok(())
@@ -284,6 +314,10 @@ where
 {
     use crate::proto::StreamFrame;
 
+    if let Some(relay) = ctx.relay.clone() {
+        return handle_stream_relay(req, relay, read, write).await;
+    }
+
     let Some(engine) = ctx.tts.as_ref() else {
         log::warn!("stream request rejected: server started without --tts-dir");
         let frame = StreamFrame {
@@ -367,6 +401,203 @@ where
                 payload: proto::error_payload(
                     ST_GENERATION_FAILED,
                     "stream ended without terminal frame",
+                ),
+            };
+            proto::write_stream_frame(write, &frame).await?;
+        }
+    }
+    Ok(())
+}
+
+// --- Relay-mode dispatch ---------------------------------------------------
+
+async fn dispatch_relay<R>(req: Request, relay: Arc<Relay>, mut read: R) -> Response
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    match req.op {
+        OP_STATUS => {
+            if relay.status().await {
+                Response {
+                    status: ST_OK,
+                    payload: Bytes::new(),
+                }
+            } else {
+                error_response(ST_BAD_REQUEST, "relay upstream not running")
+            }
+        }
+        OP_TTS => {
+            let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
+                Ok(v) => v,
+                Err(e) => return error_response(ST_BAD_REQUEST, format!("invalid tts json: {e}")),
+            };
+            let preview: String = parsed.text.chars().take(60).collect();
+            log::info!(
+                "relay tts request: cfg={} steps={} chars={} preview={:?}",
+                parsed.cfg,
+                parsed.steps,
+                parsed.text.chars().count(),
+                preview
+            );
+            let started = std::time::Instant::now();
+
+            // Watch the client connection so we abort the upstream call on
+            // disconnect.
+            let cancel = Arc::new(Notify::new());
+            let watcher_cancel = cancel.clone();
+            let watcher = tokio::spawn(async move {
+                let mut buf = [0u8; 16];
+                loop {
+                    match read.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            watcher_cancel.notify_one();
+                            return;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            });
+
+            let request = relay.tts(&parsed, req.audio);
+            let result = tokio::select! {
+                r = request => Some(r),
+                _ = cancel.notified() => None,
+            };
+            watcher.abort();
+
+            match result {
+                None => {
+                    log::info!(
+                        "relay tts request cancelled by client after {:.2?}",
+                        started.elapsed()
+                    );
+                    error_response(ST_GENERATION_FAILED, "cancelled")
+                }
+                Some(Ok(payload)) => {
+                    log::info!(
+                        "relay tts request finished in {:.2?} ({} bytes)",
+                        started.elapsed(),
+                        payload.len()
+                    );
+                    Response {
+                        status: ST_OK,
+                        payload,
+                    }
+                }
+                Some(Err(e)) => error_response(e.status, e.message),
+            }
+        }
+        other => error_response(ST_BAD_REQUEST, format!("unknown op {other}")),
+    }
+}
+
+async fn handle_stream_relay<R, W>(
+    req: Request,
+    relay: Arc<Relay>,
+    mut read: R,
+    write: &mut W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send,
+{
+    use crate::proto::StreamFrame;
+
+    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
+        Ok(v) => v,
+        Err(e) => {
+            let frame = StreamFrame {
+                kind: KIND_ERROR,
+                payload: proto::error_payload(
+                    ST_BAD_REQUEST,
+                    &format!("invalid tts json: {e}"),
+                ),
+            };
+            proto::write_stream_frame(write, &frame).await?;
+            return Ok(());
+        }
+    };
+
+    let preview: String = parsed.text.chars().take(60).collect();
+    log::info!(
+        "relay tts stream request: cfg={} steps={} chars={} preview={:?}",
+        parsed.cfg,
+        parsed.steps,
+        parsed.text.chars().count(),
+        preview
+    );
+    let started = std::time::Instant::now();
+
+    // Spawn a watcher to detect client disconnect. We can't propagate a true
+    // cancel into reqwest (no shared cancel token); instead we abort the
+    // forwarder task, which drops the upstream response and ends the request.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<StreamFrame>(8);
+    let relay_for_task = relay.clone();
+    let parsed_for_task = parsed.clone();
+    let audio_for_task = req.audio.clone();
+    let forward = tokio::spawn(async move {
+        relay_for_task
+            .tts_stream(&parsed_for_task, audio_for_task, frame_tx)
+            .await;
+    });
+
+    let mut disconnect_buf = [0u8; 16];
+    let mut final_kind: Option<u8> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            r = read.read(&mut disconnect_buf) => {
+                match r {
+                    Ok(0) | Err(_) => {
+                        log::info!(
+                            "relay tts stream cancelled by client after {:.2?}",
+                            started.elapsed()
+                        );
+                        forward.abort();
+                        return Ok(());
+                    }
+                    Ok(_) => continue,
+                }
+            }
+            maybe_frame = frame_rx.recv() => {
+                match maybe_frame {
+                    Some(frame) => {
+                        let kind = frame.kind;
+                        proto::write_stream_frame(write, &frame).await?;
+                        if matches!(kind, KIND_END | KIND_ERROR) {
+                            final_kind = Some(kind);
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let _ = forward.await;
+
+    match final_kind {
+        Some(KIND_END) => {
+            log::info!("relay tts stream finished in {:.2?}", started.elapsed());
+        }
+        Some(KIND_ERROR) => {
+            log::info!(
+                "relay tts stream ended with error after {:.2?}",
+                started.elapsed()
+            );
+        }
+        _ => {
+            log::warn!(
+                "relay tts stream channel closed without terminal frame after {:.2?}",
+                started.elapsed()
+            );
+            let frame = StreamFrame {
+                kind: KIND_ERROR,
+                payload: proto::error_payload(
+                    ST_GENERATION_FAILED,
+                    "relay stream ended without terminal frame",
                 ),
             };
             proto::write_stream_frame(write, &frame).await?;

@@ -29,6 +29,11 @@ optionally, you can also:
 * `mii-sound serve --cpu`
 to force the models to run using your CPU instead of wgpu
 
+Servers can also act as relays for `mii-http` hosted servers, you can:
+* `mii-sound serve --relay <url:[port?]>`
+and then the server will forward the requests to the specified url and respond back to local clients as if the results were generated locally
+this is specially useful for avoiding the need to specify the token directly for each single consumer, instead you pass it as `MII_SOUND_TOKEN` env var and the relay server will automatically deal with it.
+
 clients can use:
 * `mii-sound --status` to check if the server is up and running (0 yes / 1 no)
 useful for any kind of frontend that wants to consume the tool

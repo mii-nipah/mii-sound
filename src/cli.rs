@@ -67,6 +67,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub network: Option<u16>,
 
+    /// Forward all requests to a remote `mii-http`-hosted mii-sound server.
+    /// Local clients keep using the UDS / TCP socket as usual; resources are
+    /// loaded on the remote machine. Token comes from `$MII_SOUND_TOKEN`.
+    /// Format: `host[:port]`, optionally with an `http://`/`https://` scheme.
+    #[arg(long, value_name = "URL")]
+    pub relay: Option<String>,
+
     /// Suppress per-request and lifecycle logs (errors are still printed).
     #[arg(long)]
     pub quiet: bool,
