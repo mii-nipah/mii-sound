@@ -86,11 +86,7 @@ impl Relay {
         }
     }
 
-    async fn tts_clone(
-        &self,
-        req: &WireTtsRequest,
-        audio: Option<Bytes>,
-    ) -> RelayResult<Bytes> {
+    async fn tts_clone(&self, req: &WireTtsRequest, audio: Option<Bytes>) -> RelayResult<Bytes> {
         let reference = build_reference_part(req, audio)?;
         warn_on_dropped_continuation(req);
         let body = RTtsCloneBody {
@@ -191,10 +187,7 @@ fn build_plain_body(req: &WireTtsRequest) -> mii_http_client::serde_json::Value 
     Value::Object(obj)
 }
 
-fn build_reference_part(
-    req: &WireTtsRequest,
-    audio: Option<Bytes>,
-) -> RelayResult<FilePart> {
+fn build_reference_part(req: &WireTtsRequest, audio: Option<Bytes>) -> RelayResult<FilePart> {
     if req.inline_reference {
         let bytes = audio.ok_or_else(|| RelayError {
             status: ST_BAD_REQUEST,
@@ -304,8 +297,8 @@ async fn relay_wav_stream(
             header_buf.extend_from_slice(&chunk[..take]);
             pos = take;
             if header_buf.len() == WAV_HEADER_LEN {
-                let sample_rate = parse_wav_sample_rate(&header_buf)
-                    .map_err(|e| (ST_GENERATION_FAILED, e))?;
+                let sample_rate =
+                    parse_wav_sample_rate(&header_buf).map_err(|e| (ST_GENERATION_FAILED, e))?;
                 let header_frame = StreamFrame {
                     kind: KIND_HEADER,
                     payload: proto::header_payload(sample_rate),

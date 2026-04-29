@@ -322,10 +322,7 @@ where
         log::warn!("stream request rejected: server started without --tts-dir");
         let frame = StreamFrame {
             kind: KIND_ERROR,
-            payload: proto::error_payload(
-                ST_MODEL_MISSING,
-                "server was started without --tts-dir",
-            ),
+            payload: proto::error_payload(ST_MODEL_MISSING, "server was started without --tts-dir"),
         };
         proto::write_stream_frame(write, &frame).await?;
         return Ok(());
@@ -336,10 +333,7 @@ where
         Err(e) => {
             let frame = StreamFrame {
                 kind: KIND_ERROR,
-                payload: proto::error_payload(
-                    ST_BAD_REQUEST,
-                    &format!("invalid tts json: {e}"),
-                ),
+                payload: proto::error_payload(ST_BAD_REQUEST, &format!("invalid tts json: {e}")),
             };
             proto::write_stream_frame(write, &frame).await?;
             return Ok(());
@@ -388,7 +382,10 @@ where
             log::info!("tts stream finished in {:.2?}", started.elapsed());
         }
         Some(KIND_ERROR) => {
-            log::info!("tts stream ended with error after {:.2?}", started.elapsed());
+            log::info!(
+                "tts stream ended with error after {:.2?}",
+                started.elapsed()
+            );
         }
         _ => {
             log::warn!(
@@ -508,10 +505,7 @@ where
         Err(e) => {
             let frame = StreamFrame {
                 kind: KIND_ERROR,
-                payload: proto::error_payload(
-                    ST_BAD_REQUEST,
-                    &format!("invalid tts json: {e}"),
-                ),
+                payload: proto::error_payload(ST_BAD_REQUEST, &format!("invalid tts json: {e}")),
             };
             proto::write_stream_frame(write, &frame).await?;
             return Ok(());

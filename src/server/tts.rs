@@ -70,7 +70,8 @@ impl TtsEngine {
         json: Bytes,
         audio: Option<Bytes>,
         cancel: Arc<Notify>,
-    ) -> TtsResult {        let mut guard = self.inner.state.lock().await;
+    ) -> TtsResult {
+        let mut guard = self.inner.state.lock().await;
 
         // Spawn worker on demand.
         if guard.is_none() {

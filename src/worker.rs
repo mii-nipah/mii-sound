@@ -64,13 +64,9 @@ pub async fn run(args: TtsWorkerArgs) -> Result<()> {
         };
         match req.op {
             OP_TTS_STREAM => {
-                if let Err(e) = handle_stream_request(
-                    model.clone(),
-                    current_cancel.clone(),
-                    req,
-                    &mut stdout,
-                )
-                .await
+                if let Err(e) =
+                    handle_stream_request(model.clone(), current_cancel.clone(), req, &mut stdout)
+                        .await
                 {
                     log::warn!("tts worker stream io error: {e}");
                     return Ok(());
@@ -97,7 +93,8 @@ async fn handle_request(
             ST_BAD_REQUEST,
             format!("worker received non-tts op {}", req.op),
         );
-    }    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
+    }
+    let parsed: TtsRequest = match serde_json::from_slice(&req.json) {
         Ok(v) => v,
         Err(e) => return error_response(ST_BAD_REQUEST, format!("invalid tts json: {e}")),
     };
