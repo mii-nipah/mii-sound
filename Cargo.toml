@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["tts", "audio", "voxcpm", "cli", "speech"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
+[features]
+default = ["vulkan-bf16"]
+vulkan-bf16 = ["voxcpm-rs/vulkan"]
+
 [dependencies]
 voxcpm-rs = { version = "0.4.0", features = ["vulkan"] }
 burn = { version = "0.20", default-features = false }
@@ -28,6 +32,7 @@ env_logger = "0.11"
 dirs = "5"
 interprocess = { version = "2", features = ["tokio"] }
 mii-http-client = "0.1.1"
+half = "2"
 
 [patch.crates-io]
 burn-cubecl  = { git = "https://github.com/mii-nipah/voxcpm-rs", rev = "cc27585ea6ba98b5fbab77792b2df9b52219b034" }

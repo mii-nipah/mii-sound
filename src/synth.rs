@@ -4,6 +4,8 @@
 
 use crate::proto::TtsRequest;
 use anyhow::{Result, anyhow};
+#[cfg(feature = "vulkan-bf16")]
+use burn::backend::Vulkan;
 use bytes::Bytes;
 use std::path::Path;
 use voxcpm_rs::{
@@ -12,10 +14,12 @@ use voxcpm_rs::{
 
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::wgpu::WgpuDevice;
-use burn::backend::{NdArray, Wgpu};
+use burn::backend::NdArray;
 
 type CpuBackend = NdArray<f32, i32>;
-type GpuBackend = Wgpu<f32, i32>;
+// type GpuBackend = Wgpu<f32, i32>;
+#[cfg(feature = "vulkan-bf16")]
+type GpuBackend = Vulkan<half::bf16, i32>;
 
 #[allow(clippy::large_enum_variant)] // both variants are large; boxing buys little
 pub enum Model {
