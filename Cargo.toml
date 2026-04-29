@@ -13,7 +13,7 @@ keywords = ["tts", "audio", "voxcpm", "cli", "speech"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
-voxcpm-rs = { version = "0.3.0", features = ["cpu", "wgpu"] }
+voxcpm-rs = { version = "0.4.0", features = ["vulkan"] }
 burn = { version = "0.20", default-features = false }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,3 +28,7 @@ env_logger = "0.11"
 dirs = "5"
 interprocess = { version = "2", features = ["tokio"] }
 mii-http-client = "0.1.1"
+
+[patch.crates-io]
+burn-cubecl  = { git = "https://github.com/mii-nipah/voxcpm-rs", rev = "cc27585ea6ba98b5fbab77792b2df9b52219b034" }
+cubecl-spirv = { git = "https://github.com/mii-nipah/voxcpm-rs", rev = "cc27585ea6ba98b5fbab77792b2df9b52219b034" }
