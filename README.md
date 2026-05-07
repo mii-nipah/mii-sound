@@ -19,6 +19,7 @@ echo '{"text":"hello, world"}' | mii-sound tts --out hello.wav
 - [Quick start](#quick-start)
 - [Usage](#usage)
   - [Server](#server)
+  - [RunPod Docker](#runpod-docker)
   - [TTS client](#tts-client)
   - [Voice cloning](#voice-cloning)
   - [Streaming](#streaming)
@@ -44,10 +45,27 @@ echo '{"text":"hello, world"}' | mii-sound tts --out hello.wav
 
 ## Quick start
 
-Install with cargo:
+Install a prebuilt binary from GitHub Releases. With the GitHub CLI, grab the
+latest Linux archive like this:
 
 ```sh
-cargo install mii-sound
+gh release download --repo mii-nipah/mii-sound --pattern 'mii-sound-*-linux-gnu.tar.gz'
+tar -xzf mii-sound-*.tar.gz
+sudo install -Dm755 mii-sound-*/mii-sound /usr/local/bin/mii-sound
+```
+
+crates.io cannot carry this repo's Cargo patches, so its install path is the
+regular WGPU build without the Vulkan bf16 patch:
+
+```sh
+cargo install mii-sound --locked --no-default-features
+```
+
+If you prefer building the fast Vulkan path locally with the same patches,
+install from git instead:
+
+```sh
+cargo install --git https://github.com/mii-nipah/mii-sound --locked
 ```
 
 Start the server (in one terminal) pointing at a VoxCPM2 model directory:
@@ -83,6 +101,105 @@ mii-sound serve --tts-dir <path> [--cpu] [--holds 10m] [--network <port>] [--qui
 
 Clients connect to the local UDS by default. Override with `--socket <path>`
 or, for TCP servers, `--url host:port`.
+
+### RunPod Docker
+
+The repo includes a RunPod-oriented container that keeps `mii-sound serve`
+warm on the local socket and exposes the `mii-sound.http` facade through
+`mii-http`:
+
+```sh
+docker build -t mii-sound-runpod .
+```
+
+For local smoke testing with Docker + NVIDIA runtime:
+
+```sh
+docker run --rm --gpus all \
+  -p 7000:7000 \
+  -e TOKEN=dev-token \
+  -v "$PWD/.models:/workspace/models" \
+  mii-sound-runpod
+```
+
+Then hit the HTTP facade:
+
+```sh
+curl -H "Authorization: Bearer dev-token" \
+  http://localhost:7000/sound/v1/status
+
+curl -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  --data '{"text":"hello from RunPod"}' \
+  http://localhost:7000/sound/v1/tts \
+  -o runpod.wav
+```
+
+On RunPod:
+
+- Use the built image in a Pod template.
+- In the Model field, set `openbmb/VoxCPM2` so RunPod pre-caches the Hugging
+  Face model for Serverless workers.
+- For Pods, expose HTTP port `7000` and use the HTTP proxy URL.
+- For Serverless load balancing endpoints, expose HTTP port `7000` and health
+  port `7001`. The container serves `/ping` on the health port and the API on
+  `/sound/v1/...`.
+- Set `TOKEN` as an environment variable. If omitted, the container generates
+  a transient token and prints it once in the logs.
+- Attach a network volume at `/workspace` if you want fallback downloads to
+  survive Pod restarts.
+
+The startup script prefers RunPod's cached Hugging Face snapshot for
+`openbmb/VoxCPM2`, then falls back to baked weights, then to downloading into
+`/workspace/models/VoxCPM2`. `MII_SOUND_MODEL_DIR` overrides that lookup when
+you want to point at a specific complete model directory. Useful environment
+variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TOKEN` | generated | Bearer token required by the HTTP facade. |
+| `PORT` | `7000` | Main HTTP port for `mii-http`. |
+| `MII_SOUND_HTTP_PORT` | unset | Overrides `PORT` for the HTTP facade. |
+| `PORT_HEALTH` | `7001` | RunPod load-balancer health port serving `/ping`. |
+| `MII_SOUND_PORT` | unset | Legacy alias used as the HTTP port when `PORT` is unset. |
+| `MII_SOUND_MODEL_REPO` | `openbmb/VoxCPM2` | Hugging Face repo to download. |
+| `MII_SOUND_MODEL_DIR` | unset | Explicit local model directory; disables automatic RunPod cache selection. |
+| `MII_SOUND_USE_RUNPOD_MODEL_CACHE` | `1` | Set to `0` to skip RunPod's cached Hugging Face snapshot. |
+| `MII_SOUND_HF_CACHE_ROOT` | `/runpod-volume/huggingface-cache/hub` | Hugging Face cache root used by RunPod model caching. |
+| `MII_SOUND_HOLDS` | `2h` | How long to keep the worker/model warm after use. |
+| `MII_SOUND_CPU` | unset | Set to `1` to force CPU mode. |
+| `MII_SOUND_SKIP_MODEL_DOWNLOAD` | unset | Set to `1` to require a pre-mounted model. |
+| `MII_HTTP_QUIET` | `1` | Set to `0` to let `mii-http` print request logs. |
+| `HF_TOKEN` | unset | Optional Hugging Face token for downloads. |
+
+After the Pod starts, use the HTTP proxy URL shown by RunPod:
+
+```sh
+curl -H "Authorization: Bearer <same token>" \
+  https://<pod-id>-7000.proxy.runpod.net/sound/v1/status
+
+curl -H "Authorization: Bearer <same token>" \
+  -H "Content-Type: application/json" \
+  --data '{"text":"hello from RunPod"}' \
+  https://<pod-id>-7000.proxy.runpod.net/sound/v1/tts \
+  -o runpod.wav
+```
+
+For a Serverless load balancing endpoint, use the endpoint host with the same
+paths:
+
+```sh
+curl -H "Authorization: Bearer <same token>" \
+  https://<endpoint-id>.api.runpod.ai/sound/v1/status
+```
+
+If you prefer a larger image that already contains the weights, build with:
+
+```sh
+docker build \
+  --build-arg DOWNLOAD_MODEL=1 \
+  -t mii-sound-runpod:voxcpm2 .
+```
 
 ### TTS client
 

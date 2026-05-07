@@ -6,18 +6,21 @@ use crate::proto::TtsRequest;
 use anyhow::{Result, anyhow};
 #[cfg(feature = "vulkan-bf16")]
 use burn::backend::Vulkan;
+#[cfg(not(feature = "vulkan-bf16"))]
+use burn::backend::wgpu::Wgpu;
+use burn::backend::wgpu::WgpuDevice;
 use bytes::Bytes;
 use std::path::Path;
 use voxcpm_rs::{
     CancelToken, Error as VoxError, GenerateOptions, Prompt, PromptAudio, VoxCPM, audio,
 };
 
-use burn::backend::ndarray::NdArrayDevice;
-use burn::backend::wgpu::WgpuDevice;
 use burn::backend::NdArray;
+use burn::backend::ndarray::NdArrayDevice;
 
 type CpuBackend = NdArray<f32, i32>;
-// type GpuBackend = Wgpu<f32, i32>;
+#[cfg(not(feature = "vulkan-bf16"))]
+type GpuBackend = Wgpu<f32, i32>;
 #[cfg(feature = "vulkan-bf16")]
 type GpuBackend = Vulkan<half::bf16, i32>;
 
@@ -43,11 +46,15 @@ pub fn load(model_dir: &Path, cpu: bool) -> Result<Model> {
             .map_err(|e| anyhow!("failed to load tts model from {}: {e}", model_dir.display()))?;
         Ok(Model::Cpu(m))
     } else {
-        let device = WgpuDevice::default();
-        let m = VoxCPM::<GpuBackend>::from_local(model_dir, &device)
-            .map_err(|e| anyhow!("failed to load tts model from {}: {e}", model_dir.display()))?;
-        Ok(Model::Gpu(m))
+        load_gpu(model_dir)
     }
+}
+
+fn load_gpu(model_dir: &Path) -> Result<Model> {
+    let device = WgpuDevice::default();
+    let m = VoxCPM::<GpuBackend>::from_local(model_dir, &device)
+        .map_err(|e| anyhow!("failed to load tts model from {}: {e}", model_dir.display()))?;
+    Ok(Model::Gpu(m))
 }
 
 pub enum SynthError {

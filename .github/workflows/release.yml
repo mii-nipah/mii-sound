@@ -6,15 +6,31 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and upload assets even if the release tag already exists"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: Tag & publish on version bump
+  prepare:
+    name: Prepare release
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.tag_check.outputs.should_release }}
+      tag_exists: ${{ steps.tag_check.outputs.exists }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,38 +54,181 @@ jobs:
           set -euo pipefail
           VERSION="$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys;print(json.load(sys.stdin)["packages"][0]["version"])')"
+          TAG="v$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Crate version: $VERSION"
 
       - name: Check if tag already exists
         id: tag_check
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          FORCE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
         run: |
           set -euo pipefail
-          TAG="v${{ steps.version.outputs.version }}"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG already exists; skipping release."
+            if [ "$FORCE_RELEASE" = "true" ]; then
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "Tag $TAG already exists; force upload requested."
+            else
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Tag $TAG already exists; skipping release."
+            fi
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "Tag $TAG does not exist; will release."
           fi
 
-      - name: Package
-        if: steps.tag_check.outputs.exists == 'false'
-        run: cargo package --locked
+  build:
+    name: Build ${{ matrix.os }} binary
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Publish to crates.io
-        if: steps.tag_check.outputs.exists == 'false'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Create and push tag
-        if: steps.tag_check.outputs.exists == 'false'
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin mii-sound
+
+      - name: Package Unix binary
+        id: package_unix
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          TAG="v${{ steps.version.outputs.version }}"
-          git config user.name  "github-actions[bot]"
+          TARGET="$(rustc -Vv | awk '/^host:/ { print $2 }')"
+          ASSET_NAME="mii-sound-${VERSION}-${TARGET}"
+          STAGE="dist/${ASSET_NAME}"
+          ARCHIVE="dist/${ASSET_NAME}.tar.gz"
+
+          mkdir -p "$STAGE"
+          cp target/release/mii-sound "$STAGE/"
+          cp README.md LICENSE "$STAGE/"
+          tar -czf "$ARCHIVE" -C dist "$ASSET_NAME"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ASSET_NAME}.tar.gz" > "${ASSET_NAME}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${ASSET_NAME}.tar.gz" > "${ASSET_NAME}.tar.gz.sha256")
+          fi
+
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Package Windows binary
+        id: package_windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = ((rustc -Vv | Select-String '^host:').Line -replace '^host:\s*', '').Trim()
+          $assetName = "mii-sound-$env:VERSION-$target"
+          $stage = Join-Path 'dist' $assetName
+          $archive = Join-Path 'dist' "$assetName.zip"
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'target/release/mii-sound.exe' $stage
+          Copy-Item 'README.md' $stage
+          Copy-Item 'LICENSE' $stage
+          Compress-Archive -Path $stage -DestinationPath $archive -Force
+
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $fileName = Split-Path -Leaf $archive
+          Set-Content -Path "$archive.sha256" -Value "$hash  $fileName"
+
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_unix.outputs.asset_name || steps.package_windows.outputs.asset_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-publish-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Publish regular WGPU crate to crates.io
+        if: needs.prepare.outputs.tag_exists == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --no-default-features
+
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create and push tag
+        env:
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+          if [ "$TAG_EXISTS" = "true" ]; then
+            echo "Tag $TAG already exists; reusing it."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
+
+      - name: Publish release assets
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets with clobber."
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+
+          gh release upload "$TAG" dist/* --clobber
