@@ -31,6 +31,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       should_release: ${{ steps.tag_check.outputs.should_release }}
       tag_exists: ${{ steps.tag_check.outputs.exists }}
+      release_exists: ${{ steps.tag_check.outputs.release_exists }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,35 +65,40 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
           FORCE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
+
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "release_exists=false" >> "$GITHUB_OUTPUT"
+              echo "Tag $TAG already exists, but no GitHub Release exists; will upload assets."
+            fi
+
             if [ "$FORCE_RELEASE" = "true" ]; then
               echo "should_release=true" >> "$GITHUB_OUTPUT"
               echo "Tag $TAG already exists; force upload requested."
+            elif [ "$(gh release view "$TAG" >/dev/null 2>&1 && echo true || echo false)" = "false" ]; then
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
             else
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               echo "Tag $TAG already exists; skipping release."
             fi
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
             echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "Tag $TAG does not exist; will release."
           fi
 
   build:
-    name: Build ${{ matrix.os }} binary
+    name: Build Linux binary
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+    runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -113,9 +119,8 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --bin mii-sound
 
-      - name: Package Unix binary
-        id: package_unix
-        if: runner.os != 'Windows'
+      - name: Package Linux binary
+        id: package
         run: |
           set -euo pipefail
           TARGET="$(rustc -Vv | awk '/^host:/ { print $2 }')"
@@ -136,35 +141,12 @@ jobs:
 
           echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Package Windows binary
-        id: package_windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $target = ((rustc -Vv | Select-String '^host:').Line -replace '^host:\s*', '').Trim()
-          $assetName = "mii-sound-$env:VERSION-$target"
-          $stage = Join-Path 'dist' $assetName
-          $archive = Join-Path 'dist' "$assetName.zip"
-
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item 'target/release/mii-sound.exe' $stage
-          Copy-Item 'README.md' $stage
-          Copy-Item 'LICENSE' $stage
-          Compress-Archive -Path $stage -DestinationPath $archive -Force
-
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          $fileName = Split-Path -Leaf $archive
-          Set-Content -Path "$archive.sha256" -Value "$hash  $fileName"
-
-          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
-
       - name: Upload packaged binary
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package_unix.outputs.asset_name || steps.package_windows.outputs.asset_name }}
+          name: ${{ steps.package.outputs.asset_name }}
           path: |
             dist/*.tar.gz
-            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
 
@@ -199,7 +181,24 @@ jobs:
         if: needs.prepare.outputs.tag_exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked --no-default-features
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish."
+            exit 0
+          fi
+
+          log_file="$(mktemp)"
+          if cargo publish --locked --no-default-features 2>&1 | tee "$log_file"; then
+            exit 0
+          fi
+
+          if grep -Eqi 'already exists|already uploaded' "$log_file"; then
+            echo "crates.io already has $TAG; continuing to create the GitHub Release."
+            exit 0
+          fi
+
+          exit 1
 
       - name: Download packaged binaries
         uses: actions/download-artifact@v4
