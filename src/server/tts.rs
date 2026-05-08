@@ -6,18 +6,24 @@
 //! reclaim VRAM.
 
 use crate::proto::{
-    self, KIND_END, KIND_ERROR, OP_TTS, OP_TTS_STREAM, Request, ST_GENERATION_FAILED,
-    ST_MODEL_MISSING, StreamFrame,
+    self, KIND_END, KIND_ERROR, OP_TTS_STREAM, Request, ST_GENERATION_FAILED, ST_MODEL_MISSING,
+    StreamFrame, TtsRequest,
 };
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
+
+/// Default grace window if a caller passes `Duration::ZERO`. Matches the
+/// behavior described in `specs.md` and the `--batch-window` default.
+const DEFAULT_BATCH_GRACE: Duration = Duration::from_millis(300);
 
 pub enum TtsResult {
     Ok(Bytes),
@@ -42,7 +48,11 @@ struct Inner {
     model_dir: PathBuf,
     cpu: bool,
     ttl: Duration,
+    parallel: usize,
+    batch_window: Duration,
     state: Mutex<Option<RunningWorker>>,
+    queue: Mutex<VecDeque<PendingItem>>,
+    queue_notify: Notify,
 }
 
 struct RunningWorker {
@@ -53,86 +63,103 @@ struct RunningWorker {
     last_used: Instant,
 }
 
+/// One waiting non-streaming request. Items are pulled by the dispatcher,
+/// grouped by [`BatchKey`], and dispatched as a single batched forward pass.
+struct PendingItem {
+    json: Bytes,
+    audio: Option<Bytes>,
+    key: BatchKey,
+    cancel: Arc<Notify>,
+    response_tx: oneshot::Sender<TtsResult>,
+}
+
+/// Items only batch together if they share these generation parameters,
+/// because `voxcpm-rs::BatchBuilder::run` takes a single `GenerateOptions`
+/// for the whole batch.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+struct BatchKey {
+    cfg_bits: u32,
+    steps: u32,
+}
+
+impl BatchKey {
+    fn from_request(req: &TtsRequest) -> Self {
+        BatchKey {
+            cfg_bits: req.cfg.to_bits(),
+            steps: req.steps,
+        }
+    }
+}
+
 impl TtsEngine {
-    pub fn new(model_dir: PathBuf, ttl: Duration, cpu: bool) -> Self {
+    pub fn new(
+        model_dir: PathBuf,
+        ttl: Duration,
+        cpu: bool,
+        parallel: usize,
+        batch_window: Duration,
+    ) -> Self {
+        let parallel = parallel.max(1);
+        let batch_window = if batch_window.is_zero() {
+            DEFAULT_BATCH_GRACE
+        } else {
+            batch_window
+        };
         let inner = Arc::new(Inner {
             model_dir,
             cpu,
             ttl,
+            parallel,
+            batch_window,
             state: Mutex::new(None),
+            queue: Mutex::new(VecDeque::new()),
+            queue_notify: Notify::new(),
         });
         spawn_eviction_task(inner.clone());
+        spawn_dispatcher(inner.clone());
+        if parallel > 1 {
+            log::info!(
+                "tts batching enabled (parallel={parallel}, window={})",
+                humantime::format_duration(batch_window)
+            );
+        }
         TtsEngine { inner }
     }
 
+    /// Submit one TTS request to the batching scheduler. The returned future
+    /// resolves once the worker has produced a response (or the request was
+    /// cancelled by `cancel`).
     pub async fn generate(
         &self,
         json: Bytes,
         audio: Option<Bytes>,
         cancel: Arc<Notify>,
     ) -> TtsResult {
-        let mut guard = self.inner.state.lock().await;
+        // Parse cfg/steps for batch grouping. The full json bytes are still
+        // forwarded verbatim to the worker, so any other fields stay intact.
+        let parsed: TtsRequest = match serde_json::from_slice(&json) {
+            Ok(p) => p,
+            Err(e) => return TtsResult::Failed(format!("invalid tts json: {e}")),
+        };
+        let key = BatchKey::from_request(&parsed);
 
-        // Spawn worker on demand.
-        if guard.is_none() {
-            match spawn_worker(&self.inner.model_dir, self.inner.cpu).await {
-                Ok(w) => *guard = Some(w),
-                Err(e) => return TtsResult::ModelMissing(e.to_string()),
-            }
-        }
-        let worker = guard.as_mut().expect("worker just spawned");
-
-        // Detect crash before sending: if child died, drop and try once more.
-        if let Ok(Some(status)) = worker.child.try_wait() {
-            log::warn!("tts worker exited unexpectedly ({status}); respawning");
-            *guard = None;
-            // Recurse once via re-spawn.
-            drop(guard);
-            return Box::pin(retry_after_crash(self.inner.clone(), json, audio, cancel)).await;
-        }
-
-        let req = Request {
-            op: OP_TTS,
+        let (tx, rx) = oneshot::channel();
+        let item = PendingItem {
             json,
             audio,
+            key,
+            cancel,
+            response_tx: tx,
         };
-        if let Err(e) = proto::write_request(&mut worker.stdin, &req).await {
-            log::warn!("tts worker write failed: {e}; dropping worker");
-            *guard = None;
-            return TtsResult::Failed(format!("worker pipe error: {e}"));
+        {
+            let mut q = self.inner.queue.lock().await;
+            q.push_back(item);
         }
+        self.inner.queue_notify.notify_one();
 
-        let pid = worker.pid;
-        let response = tokio::select! {
-            r = proto::read_response(&mut worker.stdout) => r,
-            _ = cancel.notified() => {
-                send_cancel_signal(pid);
-                // Still wait for the worker to surface its Cancelled response
-                // (it will, once VoxCPM exits the diffusion loop).
-                proto::read_response(&mut worker.stdout).await
-            }
-        };
-
-        match response {
-            Ok(resp) => {
-                worker.last_used = Instant::now();
-                if resp.status == proto::ST_OK {
-                    TtsResult::Ok(resp.payload)
-                } else if resp.status == ST_MODEL_MISSING {
-                    TtsResult::ModelMissing(payload_str(&resp.payload))
-                } else if resp.status == ST_GENERATION_FAILED
-                    && resp.payload.as_ref() == b"cancelled"
-                {
-                    TtsResult::Cancelled
-                } else {
-                    TtsResult::Failed(payload_str(&resp.payload))
-                }
-            }
-            Err(e) => {
-                log::warn!("tts worker read failed: {e}; dropping worker");
-                *guard = None;
-                TtsResult::Failed(format!("worker pipe error: {e}"))
-            }
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => TtsResult::Failed("dispatcher dropped request".to_string()),
         }
     }
 
@@ -247,14 +274,197 @@ async fn stream_relay(
     }
 }
 
-async fn retry_after_crash(
-    inner: Arc<Inner>,
-    json: Bytes,
-    audio: Option<Bytes>,
-    cancel: Arc<Notify>,
-) -> TtsResult {
-    let engine = TtsEngine { inner };
-    engine.generate(json, audio, cancel).await
+// --- Batching dispatcher ---------------------------------------------------
+
+fn spawn_dispatcher(inner: Arc<Inner>) {
+    tokio::spawn(dispatcher_loop(inner));
+}
+
+async fn dispatcher_loop(inner: Arc<Inner>) {
+    loop {
+        // Wait for at least one item.
+        let first = loop {
+            {
+                let mut q = inner.queue.lock().await;
+                if let Some(it) = q.pop_front() {
+                    break it;
+                }
+            }
+            inner.queue_notify.notified().await;
+        };
+
+        let key = first.key;
+        let max = inner.parallel;
+        let mut batch: Vec<PendingItem> = Vec::with_capacity(max);
+        batch.push(first);
+
+        if max > 1 {
+            // Opportunistic: drain matching items already queued.
+            drain_matching(&inner, &mut batch, key, max).await;
+
+            // Grace window: wait up to batch_window for more matching items.
+            if batch.len() < max {
+                let deadline = tokio::time::Instant::now() + inner.batch_window;
+                while batch.len() < max {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let remaining = deadline - now;
+                    tokio::select! {
+                        _ = tokio::time::sleep(remaining) => break,
+                        _ = inner.queue_notify.notified() => {
+                            drain_matching(&inner, &mut batch, key, max).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        if batch.len() > 1 {
+            log::info!("tts dispatcher batched {} requests", batch.len());
+        }
+
+        dispatch_batch(&inner, batch).await;
+    }
+}
+
+/// Pull up to `max - batch.len()` items matching `key` from the queue into
+/// `batch`. Items with mismatched keys are left untouched at their position
+/// (so they keep their FIFO order for the next dispatcher round).
+async fn drain_matching(
+    inner: &Arc<Inner>,
+    batch: &mut Vec<PendingItem>,
+    key: BatchKey,
+    max: usize,
+) {
+    let mut q = inner.queue.lock().await;
+    let mut i = 0;
+    while batch.len() < max && i < q.len() {
+        if q[i].key == key {
+            batch.push(q.remove(i).expect("indexed item exists"));
+        } else {
+            i += 1;
+        }
+    }
+}
+
+async fn dispatch_batch(inner: &Arc<Inner>, batch: Vec<PendingItem>) {
+    let mut guard = inner.state.lock().await;
+
+    if guard.is_none() {
+        match spawn_worker(&inner.model_dir, inner.cpu).await {
+            Ok(w) => *guard = Some(w),
+            Err(e) => {
+                let msg = e.to_string();
+                for item in batch {
+                    let _ = item.response_tx.send(TtsResult::ModelMissing(msg.clone()));
+                }
+                return;
+            }
+        }
+    }
+    let worker = guard.as_mut().expect("worker just spawned");
+
+    // Crash check: if the child died between requests, drop it and requeue
+    // the items at the front so the next dispatcher iteration retries with a
+    // fresh worker.
+    if let Ok(Some(status)) = worker.child.try_wait() {
+        log::warn!("tts worker exited unexpectedly ({status}); respawning");
+        *guard = None;
+        drop(guard);
+        requeue_front(inner, batch).await;
+        return;
+    }
+
+    let items: Vec<proto::BatchItem> = batch
+        .iter()
+        .map(|p| proto::BatchItem {
+            json: p.json.clone(),
+            audio: p.audio.clone(),
+        })
+        .collect();
+
+    if let Err(e) = proto::write_batch_request(&mut worker.stdin, &items).await {
+        log::warn!("tts worker batch write failed: {e}; dropping worker");
+        *guard = None;
+        let msg = format!("worker pipe error: {e}");
+        for item in batch {
+            let _ = item.response_tx.send(TtsResult::Failed(msg.clone()));
+        }
+        return;
+    }
+
+    let pid = worker.pid;
+    let total = batch.len();
+    let cancelled_count = Arc::new(AtomicUsize::new(0));
+    let mut watchers = Vec::with_capacity(total);
+    for item in &batch {
+        let notify = item.cancel.clone();
+        let count = cancelled_count.clone();
+        let h = tokio::spawn(async move {
+            notify.notified().await;
+            let prev = count.fetch_add(1, Ordering::SeqCst);
+            if prev + 1 == total {
+                // Every client in this batch has dropped — voxcpm only
+                // exposes batch-wide cancellation, so we can only safely
+                // cancel when nobody is still listening.
+                send_cancel_signal(pid);
+            }
+        });
+        watchers.push(h);
+    }
+
+    let response = proto::read_batch_response(&mut worker.stdout).await;
+
+    for h in watchers {
+        h.abort();
+    }
+
+    match response {
+        Ok(resps) => {
+            worker.last_used = Instant::now();
+            if resps.len() != total {
+                log::warn!(
+                    "tts worker returned {} responses for batch of {}",
+                    resps.len(),
+                    total
+                );
+            }
+            for (item, resp) in batch.into_iter().zip(resps) {
+                let result = if resp.status == proto::ST_OK {
+                    TtsResult::Ok(resp.payload)
+                } else if resp.status == ST_MODEL_MISSING {
+                    TtsResult::ModelMissing(payload_str(&resp.payload))
+                } else if resp.status == ST_GENERATION_FAILED
+                    && resp.payload.as_ref() == b"cancelled"
+                {
+                    TtsResult::Cancelled
+                } else {
+                    TtsResult::Failed(payload_str(&resp.payload))
+                };
+                let _ = item.response_tx.send(result);
+            }
+        }
+        Err(e) => {
+            log::warn!("tts worker batch read failed: {e}; dropping worker");
+            *guard = None;
+            let msg = format!("worker pipe error: {e}");
+            for item in batch {
+                let _ = item.response_tx.send(TtsResult::Failed(msg.clone()));
+            }
+        }
+    }
+}
+
+async fn requeue_front(inner: &Arc<Inner>, batch: Vec<PendingItem>) {
+    let mut q = inner.queue.lock().await;
+    // Reverse so the original head ends up at the front again.
+    for item in batch.into_iter().rev() {
+        q.push_front(item);
+    }
+    drop(q);
+    inner.queue_notify.notify_one();
 }
 
 fn payload_str(b: &Bytes) -> String {

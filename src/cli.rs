@@ -77,6 +77,21 @@ pub struct ServeArgs {
     /// Suppress per-request and lifecycle logs (errors are still printed).
     #[arg(long)]
     pub quiet: bool,
+
+    /// Maximum number of TTS requests to process in a single batched forward
+    /// pass. The server collects pending requests within a short grace window
+    /// (see `--batch-window`) and dispatches them as one batch to the model.
+    /// Default `1` means no batching. Higher values trade a bit of
+    /// per-request latency for substantially higher throughput on GPU
+    /// backends. Hardware-bound; 4–8 is a common sweet spot.
+    #[arg(long, default_value_t = 1)]
+    pub parallel: usize,
+
+    /// How long the server waits for additional requests to fill up a batch
+    /// once at least one request is pending. Same duration format as
+    /// `--holds` (e.g. `300ms`, `1s`). Only meaningful when `--parallel > 1`.
+    #[arg(long, default_value = "300ms", value_parser = parse_duration)]
+    pub batch_window: Duration,
 }
 
 #[derive(Debug, Clone, Parser)]

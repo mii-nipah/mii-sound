@@ -42,6 +42,8 @@ echo '{"text":"hello, world"}' | mii-sound tts --out hello.wav
 - **Voice cloning.** Bring your own reference audio for supported engines.
 - **Streaming.** `--stream` to start hearing audio before the utterance is done.
 - **Cancellation.** Drop the connection, cancel the generation. No knobs needed.
+- **Batching.** `serve --parallel <N>` groups concurrent requests into one
+  batched forward pass for substantially higher GPU throughput.
 
 ## Quick start
 
@@ -88,7 +90,7 @@ That's it. Play `greeting.wav` with any audio player.
 ### Server
 
 ```sh
-mii-sound serve --tts-dir <path> [--cpu] [--holds 10m] [--network <port>] [--quiet]
+mii-sound serve --tts-dir <path> [--cpu] [--holds 10m] [--network <port>] [--parallel <N>] [--batch-window 300ms] [--quiet]
 ```
 
 - `--tts-dir <path>` — VoxCPM2 model directory (`config.json`, `tokenizer.json`,
@@ -97,6 +99,17 @@ mii-sound serve --tts-dir <path> [--cpu] [--holds 10m] [--network <port>] [--qui
 - `--holds <duration>` — keep idle resources loaded for this long. Examples:
   `30s`, `10m` (default), `1h`, `3d`. Each use resets the timer.
 - `--network <port>` — listen on TCP. Set the `TOKEN` env var to require auth.
+- `--parallel <N>` — process up to `N` concurrent requests in a single
+  batched VoxCPM forward pass (default `1`, no batching). The server holds
+  a short grace window for additional requests to arrive before
+  dispatching; requests beyond `N`, or that arrive after the window closes,
+  are queued and grouped into the next batch. Items only batch together
+  when their `cfg` and `steps` match. Sweet spot is hardware-bound; on
+  modern GPUs `4`–`8` typically yields 2–3× throughput over `1`.
+- `--batch-window <duration>` — how long the server waits for additional
+  requests to fill up a batch once one is pending. Same duration format as
+  `--holds` (e.g. `300ms`, `1s`). Default `300ms`. Only meaningful when
+  `--parallel > 1`.
 - `--quiet` — suppress per-request and lifecycle logs.
 
 Clients connect to the local UDS by default. Override with `--socket <path>`

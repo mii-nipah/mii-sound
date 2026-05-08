@@ -52,7 +52,7 @@ pub async fn run(args: ServeArgs, socket_override: Option<PathBuf>) -> Result<()
     } else {
         args.tts_dir
             .as_ref()
-            .map(|dir| TtsEngine::new(dir.clone(), args.holds, args.cpu))
+            .map(|dir| TtsEngine::new(dir.clone(), args.holds, args.cpu, args.parallel, args.batch_window))
     };
 
     if relay.is_none() {

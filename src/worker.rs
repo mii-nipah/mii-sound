@@ -10,8 +10,8 @@
 
 use crate::cli::TtsWorkerArgs;
 use crate::proto::{
-    self, KIND_CHUNK, KIND_END, KIND_ERROR, KIND_HEADER, OP_TTS, OP_TTS_STREAM, Request, Response,
-    ST_BAD_REQUEST, ST_GENERATION_FAILED, ST_OK, StreamFrame, TtsRequest,
+    self, KIND_CHUNK, KIND_END, KIND_ERROR, KIND_HEADER, OP_TTS, OP_TTS_BATCH, OP_TTS_STREAM,
+    Request, Response, ST_BAD_REQUEST, ST_GENERATION_FAILED, ST_OK, StreamFrame, TtsRequest,
 };
 use crate::synth::{self, Model, SynthError};
 use anyhow::{Context, Result, anyhow};
@@ -55,15 +55,37 @@ pub async fn run(args: TtsWorkerArgs) -> Result<()> {
     let mut stdin = BufReader::new(tokio::io::stdin());
 
     loop {
-        let req = match proto::read_request(&mut stdin).await {
-            Ok(r) => r,
+        let op = match proto::read_op(&mut stdin).await {
+            Ok(o) => o,
             Err(e) => {
                 log::info!("tts worker stdin closed: {e}");
                 return Ok(());
             }
         };
-        match req.op {
+        match op {
+            OP_TTS_BATCH => {
+                let items = match proto::read_batch_request_body(&mut stdin).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("tts worker batch read error: {e}");
+                        return Ok(());
+                    }
+                };
+                let resps =
+                    handle_batch_request(model.clone(), current_cancel.clone(), items).await;
+                if let Err(e) = proto::write_batch_response(&mut stdout, &resps).await {
+                    log::warn!("tts worker stdout closed: {e}");
+                    return Ok(());
+                }
+            }
             OP_TTS_STREAM => {
+                let req = match proto::read_request_body(&mut stdin, op).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("tts worker request read error: {e}");
+                        return Ok(());
+                    }
+                };
                 if let Err(e) =
                     handle_stream_request(model.clone(), current_cancel.clone(), req, &mut stdout)
                         .await
@@ -73,6 +95,13 @@ pub async fn run(args: TtsWorkerArgs) -> Result<()> {
                 }
             }
             _ => {
+                let req = match proto::read_request_body(&mut stdin, op).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("tts worker request read error: {e}");
+                        return Ok(());
+                    }
+                };
                 let resp = handle_request(model.clone(), current_cancel.clone(), req).await;
                 if let Err(e) = proto::write_response(&mut stdout, &resp).await {
                     log::warn!("tts worker stdout closed: {e}");
@@ -148,6 +177,107 @@ fn error_response(status: u8, msg: impl Into<String>) -> Response {
     Response {
         status,
         payload: Bytes::from(s.into_bytes()),
+    }
+}
+
+async fn handle_batch_request(
+    model: Arc<StdMutex<Model>>,
+    current_cancel: Arc<StdMutex<Option<CancelToken>>>,
+    items: Vec<proto::BatchItem>,
+) -> Vec<Response> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    // Parse JSON for every item up-front; any parse error short-circuits the
+    // whole batch with that one item failing and the rest succeeding via a
+    // sequential fallback. To keep this simple we mirror the dispatcher's
+    // contract: we fail-fast the entire batch with one error response per
+    // item if any parse fails. The dispatcher should not group bad JSON in
+    // with good — but defensive programming is cheap here.
+    let count = items.len();
+    let mut parsed: Vec<TtsRequest> = Vec::with_capacity(count);
+    for item in &items {
+        match serde_json::from_slice::<TtsRequest>(&item.json) {
+            Ok(p) => parsed.push(p),
+            Err(e) => {
+                let msg = format!("invalid tts json: {e}");
+                let mut out = Vec::with_capacity(count);
+                for _ in 0..count {
+                    out.push(error_response(ST_BAD_REQUEST, msg.clone()));
+                }
+                return out;
+            }
+        }
+    }
+
+    let cancel = CancelToken::new();
+    *current_cancel.lock().expect("cancel slot poisoned") = Some(cancel.clone());
+
+    let started = Instant::now();
+    log::info!(
+        "tts worker batch processing: items={} cfg={} steps={}",
+        count,
+        parsed[0].cfg,
+        parsed[0].steps,
+    );
+
+    let batch_items: Vec<synth::BatchItem> = parsed
+        .into_iter()
+        .zip(items)
+        .map(|(req, raw)| synth::BatchItem {
+            req,
+            inline_audio: raw.audio,
+        })
+        .collect();
+
+    let join = tokio::task::spawn_blocking(move || {
+        let guard = model.lock().expect("model mutex poisoned");
+        synth::synthesize_batch(&guard, batch_items, cancel)
+    });
+    let result = join.await;
+
+    *current_cancel.lock().expect("cancel slot poisoned") = None;
+
+    match result {
+        Ok(Ok(per_item)) => {
+            log::info!(
+                "tts worker batch finished in {:.2?} (items={})",
+                started.elapsed(),
+                per_item.len()
+            );
+            per_item
+                .into_iter()
+                .map(|r| match r {
+                    Ok(payload) => Response {
+                        status: ST_OK,
+                        payload,
+                    },
+                    Err(SynthError::Cancelled) => {
+                        error_response(ST_GENERATION_FAILED, "cancelled")
+                    }
+                    Err(SynthError::Other(msg)) => error_response(ST_GENERATION_FAILED, msg),
+                })
+                .collect()
+        }
+        Ok(Err(SynthError::Cancelled)) => {
+            log::info!(
+                "tts worker batch cancelled after {:.2?}",
+                started.elapsed()
+            );
+            (0..count)
+                .map(|_| error_response(ST_GENERATION_FAILED, "cancelled"))
+                .collect()
+        }
+        Ok(Err(SynthError::Other(msg))) => (0..count)
+            .map(|_| error_response(ST_GENERATION_FAILED, msg.clone()))
+            .collect(),
+        Err(e) => {
+            let msg = format!("worker task panicked: {e}");
+            (0..count)
+                .map(|_| error_response(ST_GENERATION_FAILED, msg.clone()))
+                .collect()
+        }
     }
 }
 

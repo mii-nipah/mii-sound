@@ -74,6 +74,32 @@ pub fn synthesize(
     }
 }
 
+/// One element of a batch. The same `cancel` token is shared by every item
+/// in a batch (voxcpm exposes batch-wide cancellation only). The batch
+/// dispatcher cancels exclusively when *every* connection has gone away.
+pub struct BatchItem {
+    pub req: TtsRequest,
+    pub inline_audio: Option<Bytes>,
+}
+
+/// Run a batched synthesis. Items are dispatched through
+/// `VoxCPM::batch().run(...)` in a single forward pass and the resulting
+/// PCM buffers are encoded back into WAV bytes in-order.
+///
+/// `cfg` and `steps` are taken from the first item — the batch dispatcher
+/// only groups items whose generation parameters match, so this is a safe
+/// shortcut. An empty `items` returns an empty vector.
+pub fn synthesize_batch(
+    model: &Model,
+    items: Vec<BatchItem>,
+    cancel: CancelToken,
+) -> Result<Vec<Result<Bytes, SynthError>>, SynthError> {
+    match model {
+        Model::Cpu(m) => synth_batch_inner(m, items, cancel),
+        Model::Gpu(m) => synth_batch_inner(m, items, cancel),
+    }
+}
+
 /// Drive a streaming generation. `on_chunk` is invoked for every audio chunk
 /// (raw f32 mono samples at the model's sample rate) as soon as it is
 /// produced. Returns the model sample rate on success so the caller can emit
@@ -170,4 +196,60 @@ fn build_prompt(req: &TtsRequest, inline_audio: Option<Bytes>) -> Result<Option<
             text: text.clone(),
         }),
     })
+}
+
+fn synth_batch_inner<B: burn::tensor::backend::Backend>(
+    model: &VoxCPM<B>,
+    items: Vec<BatchItem>,
+    cancel: CancelToken,
+) -> Result<Vec<Result<Bytes, SynthError>>, SynthError> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Take cfg/steps from the first item — the dispatcher guarantees every
+    // item in a batch shares those values. Per-item prompts vary normally.
+    let cfg = items[0].req.cfg;
+    let steps = items[0].req.steps as usize;
+
+    // Build voxcpm prompts up-front so JSON / inline-audio errors fail the
+    // whole batch with a clear message rather than partway through the
+    // forward pass. (A future improvement is to fail per-item without
+    // dropping the rest; for now this matches the single-request behavior.)
+    let mut texts: Vec<String> = Vec::with_capacity(items.len());
+    let mut prompts: Vec<Prompt> = Vec::with_capacity(items.len());
+    for item in items {
+        let prompt = build_prompt(&item.req, item.inline_audio)
+            .map_err(|e| SynthError::Other(e.to_string()))?
+            .unwrap_or_default();
+        texts.push(item.req.text);
+        prompts.push(prompt);
+    }
+
+    let opts = GenerateOptions::builder()
+        .cfg(cfg)
+        .timesteps(steps)
+        .cancel(cancel)
+        .build();
+
+    let mut builder = model.batch();
+    for (text, prompt) in texts.into_iter().zip(prompts) {
+        builder = builder.add(text, prompt);
+    }
+
+    let pcms = match builder.run(opts) {
+        Ok(v) => v,
+        Err(VoxError::Cancelled) => return Err(SynthError::Cancelled),
+        Err(e) => return Err(SynthError::Other(format!("batch generation failed: {e}"))),
+    };
+
+    let sr = model.sample_rate();
+    let mut out = Vec::with_capacity(pcms.len());
+    for pcm in pcms {
+        let res = audio::encode_wav(&pcm, sr)
+            .map(Bytes::from)
+            .map_err(|e| SynthError::Other(format!("encoding wav failed: {e}")));
+        out.push(res);
+    }
+    Ok(out)
 }

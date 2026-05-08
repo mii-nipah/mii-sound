@@ -34,6 +34,16 @@ Servers can also act as relays for `mii-http` hosted servers, you can:
 and then the server will forward the requests to the specified url and respond back to local clients as if the results were generated locally
 this is specially useful for avoiding the need to specify the token directly for each single consumer, instead you pass it as `MII_SOUND_TOKEN` env var and the relay server will automatically deal with it.
 
+Usually the server processes each single request sequentially, but you can now also configure it to accept a certain degree of parallelism with:
+* `mii-sound serve --parallel <number>`
+this will allow the server to process up to <number> requests at the same time
+The server will have a 300ms window for clients to send up requests in parallel before it starts processing, this allows users to spawn multiple clients and have this batch processing benefit. Requests after the maximum specified number will be queued as normal, as well as requests outside of that window. Naturally, queuing is smart and will also happen for queued requests, the server will decide judiciously to group them.
+The default value for `--parallel` is 1, meaning no parallelism, and the maximum is not defined and will depend on the hardware capabilities of the server machine.
+
+To configure a custom batching window you can also pass:
+* `mii-sound serve --batch-window <time>`
+Where `<time>` is a duration in the same format as `--holds` (e.g. '300ms', '1s', etc.). This sets the time window during which incoming requests can be grouped together for batch processing. The default value is 300ms.
+
 clients can use:
 * `mii-sound --status` to check if the server is up and running (0 yes / 1 no)
 useful for any kind of frontend that wants to consume the tool

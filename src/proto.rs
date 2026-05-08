@@ -17,6 +17,20 @@ pub const PROTO_VERSION: u8 = 1;
 pub const OP_TTS: u8 = 1;
 pub const OP_STATUS: u8 = 2;
 pub const OP_TTS_STREAM: u8 = 3;
+/// Worker-only op: a batch of independent TTS items dispatched as a single
+/// VoxCPM batched forward pass. Wire format after the standard
+/// `version | op` header:
+///
+///     u32 count
+///     repeated `count` times: u32 json_len | json | u32 audio_len | audio
+///
+/// Response wire format (worker → frontend):
+///
+///     u32 count
+///     repeated `count` times: u8 status | u32 payload_len | payload
+///
+/// Item order is preserved between request and response.
+pub const OP_TTS_BATCH: u8 = 4;
 
 // Status bytes reuse exit codes for their natural meaning.
 pub const ST_OK: u8 = 0;
@@ -44,6 +58,9 @@ const MAX_JSON: u32 = 1024 * 1024; // 1 MiB JSON
 const MAX_AUDIO: u32 = 256 * 1024 * 1024; // 256 MiB audio
 const MAX_PAYLOAD: u32 = 512 * 1024 * 1024; // 512 MiB response
 const MAX_TOKEN: u32 = 4096;
+/// Hard upper bound on items in one batch envelope. Generous; the configured
+/// `--parallel` ceiling is normally well below this.
+const MAX_BATCH: u32 = 1024;
 
 /// Wire-level TTS request. The user-facing JSON only carries `text`,
 /// `reference`, and `continuation` (per specs.md); the client merges its CLI
@@ -120,11 +137,23 @@ pub async fn write_request<W: AsyncWrite + Unpin>(w: &mut W, req: &Request) -> R
 }
 
 pub async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> Result<Request> {
+    let op = read_op(r).await?;
+    read_request_body(r, op).await
+}
+
+/// Read just the `version | op` header. Used by the worker so it can
+/// dispatch on op (single vs. batch) before reading the body.
+pub async fn read_op<R: AsyncRead + Unpin>(r: &mut R) -> Result<u8> {
     let version = r.read_u8().await?;
     if version != PROTO_VERSION {
         bail!("unsupported protocol version {version}");
     }
-    let op = r.read_u8().await?;
+    r.read_u8().await.map_err(|e| anyhow!("reading op: {e}"))
+}
+
+/// Read the body of a single (non-batch) request, given the op already
+/// pulled from the wire.
+pub async fn read_request_body<R: AsyncRead + Unpin>(r: &mut R, op: u8) -> Result<Request> {
     let json_len = r.read_u32_le().await?;
     if json_len > MAX_JSON {
         bail!("json frame too large: {json_len}");
@@ -147,6 +176,117 @@ pub async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> Result<Request> {
         json: Bytes::from(json),
         audio,
     })
+}
+
+/// One element of a batch request. `json` is a serialized [`TtsRequest`];
+/// `audio` is the optional inline reference clip, identical to the
+/// single-request `Request::audio` field.
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub json: Bytes,
+    pub audio: Option<Bytes>,
+}
+
+/// Write a batch envelope to the worker pipe. Caller is responsible for
+/// having written nothing else to `w` since the previous full
+/// request/response.
+pub async fn write_batch_request<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    items: &[BatchItem],
+) -> Result<()> {
+    if items.len() as u64 > MAX_BATCH as u64 {
+        bail!("batch too large: {}", items.len());
+    }
+    w.write_u8(PROTO_VERSION).await?;
+    w.write_u8(OP_TTS_BATCH).await?;
+    w.write_u32_le(items.len() as u32).await?;
+    for item in items {
+        w.write_u32_le(item.json.len() as u32).await?;
+        w.write_all(&item.json).await?;
+        let audio = item.audio.as_ref().map(|b| b.as_ref()).unwrap_or(&[]);
+        w.write_u32_le(audio.len() as u32).await?;
+        if !audio.is_empty() {
+            w.write_all(audio).await?;
+        }
+    }
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read the body of a batch request (after [`read_op`] returned
+/// [`OP_TTS_BATCH`]).
+pub async fn read_batch_request_body<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<BatchItem>> {
+    let count = r.read_u32_le().await?;
+    if count > MAX_BATCH {
+        bail!("batch frame too large: {count}");
+    }
+    let mut items = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let json_len = r.read_u32_le().await?;
+        if json_len > MAX_JSON {
+            bail!("batch json frame too large: {json_len}");
+        }
+        let mut json = vec![0u8; json_len as usize];
+        r.read_exact(&mut json).await?;
+        let audio_len = r.read_u32_le().await?;
+        if audio_len > MAX_AUDIO {
+            bail!("batch audio frame too large: {audio_len}");
+        }
+        let audio = if audio_len == 0 {
+            None
+        } else {
+            let mut buf = vec![0u8; audio_len as usize];
+            r.read_exact(&mut buf).await?;
+            Some(Bytes::from(buf))
+        };
+        items.push(BatchItem {
+            json: Bytes::from(json),
+            audio,
+        });
+    }
+    Ok(items)
+}
+
+/// Write a batch response to the frontend (worker → frontend).
+pub async fn write_batch_response<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    responses: &[Response],
+) -> Result<()> {
+    w.write_u32_le(responses.len() as u32).await?;
+    for resp in responses {
+        w.write_u8(resp.status).await?;
+        w.write_u32_le(resp.payload.len() as u32).await?;
+        if !resp.payload.is_empty() {
+            w.write_all(&resp.payload).await?;
+        }
+    }
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read a batch response from the worker pipe.
+pub async fn read_batch_response<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<Response>> {
+    let count = r.read_u32_le().await?;
+    if count > MAX_BATCH {
+        bail!("batch response too large: {count}");
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let status = r.read_u8().await?;
+        let len = r.read_u32_le().await?;
+        if len > MAX_PAYLOAD {
+            bail!("batch response payload too large: {len}");
+        }
+        let mut buf = vec![0u8; len as usize];
+        if len > 0 {
+            r.read_exact(&mut buf).await?;
+        }
+        out.push(Response {
+            status,
+            payload: Bytes::from(buf),
+        });
+    }
+    Ok(out)
 }
 
 pub async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> Result<()> {

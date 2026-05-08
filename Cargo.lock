@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "mii-sound"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "burn",
@@ -5616,9 +5616,9 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
 name = "voxcpm-rs"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d277fb7684821a2ba8301d8d5ca40e6e2f01e2d05b24b17f021b0384d973916d"
+checksum = "9f746bdb4a1fa1105f4956dc29f2c42d62d8c7d3dd2fb7b0ef7982f7691e9173"
 dependencies = [
  "burn",
  "burn-store",
